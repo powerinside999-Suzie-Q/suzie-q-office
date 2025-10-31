@@ -18,3 +18,19 @@ class AgentInvokePayload(BaseModel):
     text: Optional[str] = None
     context: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+from pydantic import BaseModel
+from typing import Optional, Any, Dict, List
+
+class RememberPayload(BaseModel):
+    content: str
+    tags: Optional[List[str]] = None
+    importance: Optional[int] = 1
+    source: Optional[str] = None
+    department: Optional[str] = None
+    actor: Optional[str] = None
+
+class RecallPayload(BaseModel):
+    query: str
+    top_k: Optional[int] = 8
+    min_similarity: Optional[float] = 0.15
+    department: Optional[str] = None
