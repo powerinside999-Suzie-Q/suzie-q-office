@@ -81,7 +81,28 @@ async def telegram_webhook(update: TelegramUpdate):
 @app.post("/agents/{dept}/{role}/{name}")
 async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayload):
     text = (payload.text or payload.context) or ""
-    prompt = f"You are an AI {role} for the {dept} department named {name}. Be specialized and concise. Input: {text}"
+
+    # NEW: recall for this department
+    try:
+        q_emb = await embed_text(text)
+        matches = await supabase_rpc("match_long_term_memory", {
+            "query_embedding": q_emb,
+            "match_count": 6,
+            "min_cosine_similarity": 0.20,
+            "dept": dept
+        }) or []
+        mem_snips = "\n".join([f"- {m['content']}" for m in matches])
+    except Exception:
+        mem_snips = ""
+
+    prompt = (
+        f"You are an AI {role} for the {dept} department named {name}. "
+        f"Be specialized, practical, and concise.\n"
+    )
+    if mem_snips:
+        prompt += f"Relevant department memory:\n{mem_snips}\n\n"
+    prompt += f"User: {text}"
+
     decision = await call_brain(prompt)
 
     await supabase_insert("memory", {
@@ -93,6 +114,7 @@ async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayl
         "actor": name
     })
     return {"agent": name, "role": role, "dept": dept, "decision": decision}
+
 
 @app.post("/cron/daily-report")
 async def daily_report():
