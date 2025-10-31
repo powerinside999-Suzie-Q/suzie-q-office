@@ -1,0 +1,22 @@
+
+services:
+  - type: web
+    name: suzie-q-fastapi
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BRAIN_URL
+        value: https://suzie-q-brain.onrender.com/analyze
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: CEO_SLACK_CHANNEL_ID
+        sync: false
