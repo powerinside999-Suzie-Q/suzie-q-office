@@ -92,3 +92,41 @@ async def daily_report():
         "timestamp": now_utc_iso(),
     })
     return {"ok": True, "summary": decision}
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from app.schemas import SlackEvent, TelegramUpdate, AgentInvokePayload, RememberPayload, RecallPayload
+from app.utils import (
+    call_brain, supabase_insert, supabase_rpc, slack_post_message, telegram_send_message,
+    now_utc_iso, embed_text
+)
+
+app = FastAPI(title="Suzie Q – FastAPI OS")
+
+# --- Memory: Remember ---
+@app.post("/memory/remember")
+async def remember(payload: RememberPayload):
+    emb = await embed_text(payload.content)
+    row = {
+        "content": payload.content,
+        "embedding": emb,
+        "tags": payload.tags or [],
+        "importance": payload.importance or 1,
+        "source": payload.source or "api",
+        "department": payload.department,
+        "actor": payload.actor,
+        "created_at": now_utc_iso(),
+    }
+    await supabase_insert("long_term_memory", row)
+    return {"ok": True}
+
+# --- Memory: Recall ---
+@app.post("/memory/recall")
+async def recall(payload: RecallPayload):
+    emb = await embed_text(payload.query)
+    matches = await supabase_rpc("match_long_term_memory", {
+        "query_embedding": emb,
+        "match_count": payload.top_k,
+        "min_cosine_similarity": payload.min_similarity,
+        "dept": payload.department,
+    })
+    return {"ok": True, "matches": matches}
