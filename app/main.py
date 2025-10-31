@@ -28,9 +28,28 @@ async def slack_events(req: Request):
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
 
-    decision = await call_brain(f"You are Suzie Q (CEO). Respond concisely. Input: {text}")
-    await slack_post_message(channel, decision, thread_ts=thread_ts)
+    # NEW: recall relevant memory (no dept filter here)
+    try:
+        q_emb = await embed_text(text)
+        matches = await supabase_rpc("match_long_term_memory", {
+            "query_embedding": q_emb,
+            "match_count": 6,            # tune to 3–8
+            "min_cosine_similarity": 0.20,
+            "dept": None
+        }) or []
+        memory_snips = "\n".join([f"- {m['content']}" for m in matches])
+    except Exception:
+        memory_snips = ""
 
+    # Build enriched context for the brain
+    prefix = "You are Suzie Q (CEO). Use relevant memory when helpful.\n"
+    if memory_snips:
+        prefix += f"Relevant memory:\n{memory_snips}\n\n"
+    prompt = prefix + f"User: {text}"
+
+    decision = await call_brain(prompt)
+
+    await slack_post_message(channel, decision, thread_ts=thread_ts)
     await supabase_insert("memory", {
         "context": text,
         "decision": decision,
@@ -38,6 +57,7 @@ async def slack_events(req: Request):
         "timestamp": now_utc_iso(),
     })
     return {"ok": True}
+
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: TelegramUpdate):
