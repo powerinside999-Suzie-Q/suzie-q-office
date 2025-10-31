@@ -3,7 +3,7 @@
 
 **Endpoints**
 - POST /slack/events
-- POST /telegram/webhook
+- POST https://suzie-q-office.onrender.com/telegram/webhook
 - POST /agents/{dept}/{role}/{name}
 - POST /cron/daily-report
 
