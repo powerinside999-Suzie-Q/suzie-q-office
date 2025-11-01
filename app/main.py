@@ -101,6 +101,74 @@ async def slack_events(req: Request):
         "timestamp": now_utc_iso(),
     })
     return {"ok": True}
+from fastapi import Form
+from urllib.parse import parse_qs
+from app.utils import slack_post_message
+
+@app.post("/slack/commands/hire")
+async def slack_hire(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    text = data.get("text", "").strip()
+    user = data.get("user_name")
+    channel_id = data.get("channel_id")
+
+    if not text:
+        return PlainTextResponse("Usage: /hire <department> [names...]", status_code=200)
+
+    parts = text.split()
+    dept = parts[0]
+    names = parts[1:]
+    payload = {"department": dept, "employee_names": names}
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{os.getenv('PUBLIC_BASE_URL')}/staff/create", json=payload)
+        reply = r.text
+    await slack_post_message(channel_id, f"Hiring request from @{user}:\n{reply}")
+    return PlainTextResponse(f"Hiring {dept} department...", status_code=200)
+
+
+@app.post("/slack/commands/fire")
+async def slack_fire(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    staff_id = data.get("text", "").strip()
+    if not staff_id:
+        return PlainTextResponse("Usage: /fire <staff_uuid>", status_code=200)
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{os.getenv('PUBLIC_BASE_URL')}/staff/delete", json={"staff_id": staff_id})
+    return PlainTextResponse(f"Firing initiated for {staff_id}.", status_code=200)
+
+
+@app.post("/slack/commands/memory")
+async def slack_memory(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    text = data.get("text", "").strip()
+    if text.lower().startswith("remember "):
+        note = text[len("remember "):]
+        await httpx.AsyncClient().post(f"{os.getenv('PUBLIC_BASE_URL')}/memory/remember",
+                                       json={"content": note})
+        return PlainTextResponse("Noted in long-term memory.", status_code=200)
+    elif text.lower().startswith("recall "):
+        query = text[len("recall "):]
+        r = await httpx.AsyncClient().post(f"{os.getenv('PUBLIC_BASE_URL')}/memory/recall",
+                                           json={"query": query, "top_k": 5})
+        return PlainTextResponse(r.text[:2800], status_code=200)
+    return PlainTextResponse("Usage: /memory remember <text> | recall <query>", status_code=200)
+
+
+@app.post("/slack/commands/ask")
+async def slack_ask(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    question = data.get("text", "").strip()
+    channel_id = data.get("channel_id")
+    if not question:
+        return PlainTextResponse("Usage: /ask <question>", status_code=200)
+    decision = await call_brain(f"CEO mode: {question}")
+    await slack_post_message(channel_id, decision)
+    return PlainTextResponse("Sent to Suzie Q...", status_code=200)
+
 
 # ------------- Slack Slash Commands (form-encoded) -------------
 @app.post("/slack/commands")
