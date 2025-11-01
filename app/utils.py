@@ -7,6 +7,19 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 BRAIN_URL = os.getenv("BRAIN_URL", "https://suzie-q-brain.onrender.com/analyze")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+EMBED_MODEL = "text-embedding-3-large"
+
+async def importance_score(text: str) -> int:
+    """
+    Ask OpenAI to rate importance 1..5 (5 = critical policy/goal/insight).
+    We keep it simple and robust.
+    """
+    if not OPENAI_API_KEY:
+        return 1
+    prompt = (
+        "Rate the business importance of the following note on a 1-5 integer scale. "
+        "1=trivial, 3=useful, 5=critical for CEO memory.\n"
+        f"Note: {text}\nReturn ONLY the integer."
 
 HEADERS_SB = {
     "apikey": SUPABASE_KEY,
@@ -78,16 +91,22 @@ EMBED_MODEL = "text-embedding-3-large"  # or "text-embedding-3-small"
 async def embed_text(text: str) -> list[float]:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
-    async with httpx.AsyncClient(timeout=60, headers={
+    async with httpx.AsyncClient(timeout=40, headers={
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }) as client:
-        r = await client.post("https://api.openai.com/v1/embeddings", json={
-            "input": text,
-            "model": EMBED_MODEL
+        r = await client.post("https://api.openai.com/v1/chat/completions", json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role":"user","content": prompt}],
+            "temperature": 0
         })
         r.raise_for_status()
-        return r.json()["data"][0]["embedding"]
+        text_out = r.json()["choices"][0]["message"]["content"].strip()
+    try:
+        n = int("".join(ch for ch in text_out if ch.isdigit()))
+        return max(1, min(5, n))
+    except:
+        return 2  # safe default
 
 # ---------- Supabase I/O ----------
 async def supabase_insert(table: str, payload: dict):
