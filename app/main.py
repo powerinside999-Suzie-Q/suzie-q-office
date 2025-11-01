@@ -68,12 +68,16 @@ async def slack_events(req: Request):
     memory_snips = ""
     try:
         q_emb = await embed_text(text)
-        matches = await supabase_rpc("match_long_term_memory", {
-            "query_embedding": q_emb,
-            "match_count": 6,
-            "min_cosine_similarity": 0.20,
-            "dept": None,
-        }) or []
+        matches = await supabase_rpc("match_long_term_memory_ranked", {
+    "query_embedding": q_emb,
+    "match_count": 6,
+    "dept": None,                 # or dept for agents route
+    "min_cosine_similarity": 0.20,
+    "half_life_days": 14.0,       # tune: smaller = favor fresher memories
+    "alpha": 0.6,                 # weight for importance
+    "beta": 0.3                   # weight for frequency
+}) or []
+
         memory_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         memory_snips = ""
@@ -191,12 +195,16 @@ async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayl
     mem_snips = ""
     try:
         q_emb = await embed_text(text)
-        matches = await supabase_rpc("match_long_term_memory", {
-            "query_embedding": q_emb,
-            "match_count": 6,
-            "min_cosine_similarity": 0.20,
-            "dept": dept,
-        }) or []
+        matches = await supabase_rpc("match_long_term_memory_ranked", {
+    "query_embedding": q_emb,
+    "match_count": 6,
+    "dept": None,                 # or dept for agents route
+    "min_cosine_similarity": 0.20,
+    "half_life_days": 14.0,       # tune: smaller = favor fresher memories
+    "alpha": 0.6,                 # weight for importance
+    "beta": 0.3                   # weight for frequency
+}) or []
+
         mem_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         mem_snips = ""
@@ -306,18 +314,19 @@ async def daily_report():
 @app.post("/memory/remember")
 async def remember(payload: RememberPayload):
     emb = await embed_text(payload.content)
+    imp = payload.importance if payload.importance and 1 <= payload.importance <= 5 else await importance_score(payload.content)
     row = {
         "content": payload.content,
         "embedding": emb,
         "tags": payload.tags or [],
-        "importance": payload.importance or 1,
+        "importance": imp,
         "source": payload.source or "api",
         "department": payload.department,
         "actor": payload.actor,
         "created_at": now_utc_iso(),
     }
     await supabase_insert("long_term_memory", row)
-    return {"ok": True}
+    return {"ok": True, "importance": imp}
 
 @app.post("/memory/recall")
 async def recall(payload: RecallPayload):
