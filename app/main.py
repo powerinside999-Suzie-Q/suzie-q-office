@@ -119,45 +119,64 @@ async def slack_commands(
 
 # ------------- Telegram Webhook -------------
 @app.post("/telegram/webhook")
-async def telegram_webhook(update: TelegramUpdate):
-    """
-    Telegram sends POST JSON updates here.
-    """
-    msg = update.message or {}
-    chat = msg.get("chat", {}) or {}
-    text = msg.get("text") or ""
+async def telegram_webhook(update: dict):
+    # 1) Extract chat_id & text safely from multiple update types
+    msg = update.get("message") or update.get("edited_message") or \
+          update.get("channel_post") or update.get("edited_channel_post") or {}
+    chat = (msg.get("chat") or {})
     chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
 
-    # Recall (global)
+    # If we can't reply (no chat), just 200 OK so Telegram stops retrying
+    if not chat_id:
+        return {"ok": True}
+
+    # 2) Try recall + brain, but never crash if they fail
+    decision = None
+
+    # Optional recall (safe-wrap)
     memory_snips = ""
     try:
-        q_emb = await embed_text(text)
-        matches = await supabase_rpc("match_long_term_memory", {
-            "query_embedding": q_emb,
-            "match_count": 6,
-            "min_cosine_similarity": 0.20,
-            "dept": None,
-        }) or []
-        memory_snips = "\n".join([f"- {m['content']}" for m in matches])
+        if text:
+            q_emb = await embed_text(text)
+            matches = await supabase_rpc("match_long_term_memory", {
+                "query_embedding": q_emb,
+                "match_count": 6,
+                "min_cosine_similarity": 0.20,
+                "dept": None,
+            }) or []
+            memory_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         memory_snips = ""
 
-    prefix = "You are Suzie Q (CEO). Use relevant memory when helpful.\n"
-    if memory_snips:
-        prefix += f"Relevant memory:\n{memory_snips}\n\n"
-    prompt = prefix + f"User: {text}"
+    # Call brain (safe-wrap)
+    try:
+        prefix = "You are Suzie Q (CEO). Use relevant memory when helpful.\n"
+        if memory_snips:
+            prefix += f"Relevant memory:\n{memory_snips}\n\n"
+        prompt = prefix + f"User: {text or 'Respond briefly and introduce yourself.'}"
+        decision = await call_brain(prompt)
+    except Exception:
+        # Fallback if brain is down
+        decision = "Hi! I’m Suzie Q. I’m online via Telegram. How can I help right now?"
 
-    decision = await call_brain(prompt)
+    # 3) Send reply (safe-wrap: don’t crash if token missing)
+    try:
+        await telegram_send_message(chat_id, decision or "Okay!")
+    except Exception:
+        pass
 
-    if chat_id:
-        await telegram_send_message(chat_id, decision)
+    # 4) Log memory (safe-wrap)
+    try:
+        await supabase_insert("memory", {
+            "context": text,
+            "decision": decision,
+            "source": "telegram",
+            "timestamp": now_utc_iso(),
+        })
+    except Exception:
+        pass
 
-    await supabase_insert("memory", {
-        "context": text,
-        "decision": decision,
-        "source": "telegram",
-        "timestamp": now_utc_iso(),
-    })
     return {"ok": True}
 
 # ------------- Agents (Directors/Employees) -------------
