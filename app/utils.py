@@ -1,9 +1,10 @@
-
+import urllib.parse
 import os, httpx
 from datetime import datetime, timezone
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 BRAIN_URL = os.getenv("BRAIN_URL", "https://suzie-q-brain.onrender.com/analyze")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -26,6 +27,33 @@ HEADERS_SB = {
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
 }
+async def sb_get_one(table: str, filter_qs: str):
+    """Return first row or None. filter_qs example: 'select=*&name=eq.Sales' """
+    if not SUPABASE_URL:
+        return None
+    async with httpx.AsyncClient(timeout=60, headers=HEADERS_SB) as client:
+        r = await client.get(f"{SUPABASE_URL}/rest/v1/{table}?{filter_qs}")
+        r.raise_for_status()
+        arr = r.json()
+        return arr[0] if arr else None
+
+async def sb_insert_returning(table: str, payload: dict):
+    """Insert row and return created row (requires 'return=representation')."""
+    if not SUPABASE_URL:
+        return None
+    headers = dict(HEADERS_SB)
+    headers["Prefer"] = "return=representation"
+    async with httpx.AsyncClient(timeout=60, headers=headers) as client:
+        r = await client.post(f"{SUPABASE_URL}/rest/v1/{table}", json=payload)
+        r.raise_for_status()
+        arr = r.json()
+        return arr[0] if arr else None
+
+def agent_endpoint(dept: str, role: str, name: str) -> str:
+    """Builds the public agent URL (uses PUBLIC_BASE_URL)."""
+    # Percent-encode path segments
+    def enc(s: str) -> str: return urllib.parse.quote(s, safe="")
+    return f"{PUBLIC_BASE_URL}/agents/{enc(dept)}/{enc(role)}/{enc(name)}"
 
 async def call_brain(context: str) -> str:
     async with httpx.AsyncClient(timeout=60) as client:
