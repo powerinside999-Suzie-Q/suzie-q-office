@@ -34,3 +34,16 @@ class RecallPayload(BaseModel):
     top_k: Optional[int] = 8
     min_similarity: Optional[float] = 0.15
     department: Optional[str] = None
+
+class StaffCreatePayload(BaseModel):
+    department: str
+    employees_count: Optional[int] = 5
+    employee_names: Optional[List[str]] = None  # if not given, auto-generate
+    create_channel: Optional[bool] = False
+    slack_channel_id: Optional[str] = None      # if you already made a #dept-... channel
+
+class StaffListQuery(BaseModel):
+    department: Optional[str] = None
+
+class StaffDeletePayload(BaseModel):
+    staff_id: str  # uuid of the staff member to deactivate/fire
