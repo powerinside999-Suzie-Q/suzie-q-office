@@ -228,6 +228,149 @@ async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayl
         "actor": name,
     })
     return {"agent": name, "role": role, "dept": dept, "decision": decision}
+from app.schemas import StaffCreatePayload, StaffDeletePayload
+from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, slack_post_message
+
+@app.post("/staff/create")
+async def staff_create(payload: StaffCreatePayload):
+    """
+    Create a department (if missing), a Director, and N employees.
+    Wire reporting_lines (employees -> director).
+    Returns the created/located records and ready-to-call agent URLs.
+    """
+    dept_name = payload.department.strip()
+    if not dept_name:
+        raise HTTPException(status_code=400, detail="department is required")
+
+    # 1) Department: get or create
+    # NOTE: spaces must be url-encoded for the filter; use eq.<value>
+    dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
+    if not dep_row:
+        dep_row = await sb_insert_returning("departments", {
+            "name": dept_name,
+            "slack_channel_id": payload.slack_channel_id or None
+        })
+    department_id = dep_row["id"]
+
+    # 2) Director: get or create by (name, role, department_id)
+    director_name = f"Director {dept_name.title()}"
+    dir_row = await sb_get_one(
+        "staff",
+        f"select=*&name=eq.{urllib.parse.quote(director_name)}&role=eq.Director&department_id=eq.{department_id}"
+    )
+    if not dir_row:
+        dir_row = await sb_insert_returning("staff", {
+            "name": director_name,
+            "role": "Director",
+            "department_id": department_id,
+            "status": "active",
+            "agent_webhook": agent_endpoint(dept_name, "Director", director_name)  # public agent endpoint
+        })
+
+    created = {"department": dep_row, "director": dir_row, "employees": []}
+
+    # 3) Employees
+    count = max(1, payload.employees_count or 5)
+    if payload.employee_names and len(payload.employee_names) > 0:
+        base_names = payload.employee_names[:count]
+        # ensure list length = count
+        if len(base_names) < count:
+            base_names += [f"{dept_name.title()} Employee {i}" for i in range(len(base_names)+1, count+1)]
+    else:
+        base_names = [f"{dept_name.title()} Employee {i}" for i in range(1, count+1)]
+
+    employee_rows = []
+    for nm in base_names:
+        emp_row = await sb_get_one(
+            "staff",
+            f"select=*&name=eq.{urllib.parse.quote(nm)}&role=eq.Employee&department_id=eq.{department_id}"
+        )
+        if not emp_row:
+            emp_row = await sb_insert_returning("staff", {
+                "name": nm,
+                "role": "Employee",
+                "department_id": department_id,
+                "status": "active",
+                "agent_webhook": agent_endpoint(dept_name, "Employee", nm)
+            })
+        employee_rows.append(emp_row)
+    created["employees"] = employee_rows
+
+    # 4) Reporting lines (employees -> director)
+    for er in employee_rows:
+        # Check if reporting already exists to avoid duplicates:
+        existing = await sb_get_one(
+            "reporting_lines",
+            f"select=*&manager_id=eq.{dir_row['id']}&report_id=eq.{er['id']}"
+        )
+        if not existing:
+            await sb_insert_returning("reporting_lines", {
+                "manager_id": dir_row["id"],
+                "report_id": er["id"]
+            })
+
+    # 5) Optional: announce in Slack CEO channel
+    ceo_channel = os.getenv("CEO_SLACK_CHANNEL_ID", "")
+    if ceo_channel:
+        try:
+            lines = [
+                f"Department **{dept_name}** ready.",
+                f"Director: {director_name} → {dir_row.get('agent_webhook','')}",
+            ] + [f"Employee: {er['name']} → {er.get('agent_webhook','')}" for er in employee_rows]
+            await slack_post_message(ceo_channel, "\n".join(lines))
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "department": {"id": department_id, "name": dept_name},
+        "director": {
+            "id": dir_row["id"],
+            "name": director_name,
+            "agent_url": dir_row.get("agent_webhook")
+        },
+        "employees": [
+            {"id": er["id"], "name": er["name"], "agent_url": er.get("agent_webhook")}
+            for er in employee_rows
+        ],
+    }
+
+@app.get("/staff/list")
+async def staff_list(department: Optional[str] = None):
+    """
+    List staff (optionally by department name).
+    """
+    if department:
+        dep = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(department)}")
+        if not dep:
+            return {"ok": True, "staff": []}
+        dep_id = dep["id"]
+        rows = await supabase_select("staff", f"select=*&department_id=eq.{dep_id}&order=created_at.asc")
+    else:
+        rows = await supabase_select("staff", "select=*&order=created_at.asc")
+    return {"ok": True, "staff": rows or []}
+
+@app.post("/staff/delete")
+async def staff_delete(payload: StaffDeletePayload):
+    """
+    Soft-delete (deactivate) a staff member by id.
+    """
+    # Soft delete by status=inactive (safer than hard delete)
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    async with httpx.AsyncClient(timeout=60, headers=HEADERS_SB) as client:
+        # Patch-like behavior using 'Prefer: resolution=merge-duplicates' requires UPSERT constraints.
+        # Here we use RPC-free update via ?id=eq. filter.
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/staff?id=eq.{payload.staff_id}",
+            json={"status": "inactive"},
+        )
+        # Some Supabase setups require headers["Prefer"] = "return=representation"
+        # but we don't need the body here.
+        if r.status_code >= 400:
+            raise HTTPException(status_code=500, detail=f"Supabase update failed: {r.text}")
+    return {"ok": True}
+
 
 # ------------- Simple Department Router (optional) -------------
 @app.post("/route/{dept}")
