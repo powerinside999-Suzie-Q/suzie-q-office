@@ -107,13 +107,12 @@ async def slack_events(req: Request):
         "timestamp": now_utc_iso(),
     })
     return {"ok": True}
-from fastapi import Form
+
 from urllib.parse import parse_qs
-from app.utils import slack_post_message
+from fastapi.responses import PlainTextResponse
 
 @app.post("/slack/commands/hire")
 async def slack_hire(req: Request):
-    # Parse Slack's form-encoded body
     body = await req.body()
     data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
     text = (data.get("text") or "").strip()
@@ -123,23 +122,17 @@ async def slack_hire(req: Request):
     if not text:
         return PlainTextResponse("Usage: /hire <department> [names...]", status_code=200)
 
-    # Immediately acknowledge to avoid 'dispatch_failed'
-    # (Slack requires a 200 OK within ~3s)
-    # We'll do the work after returning.
+    dept, *names = text.split()
+
+    # Fast ACK so Slack doesn't 'dispatch_failed'
+    # Then do the work and post results to the channel.
     try:
-        # Fire-and-forget background call
-        dept, *names = text.split()
-        payload = {"department": dept, "employee_names": names} if names else {"department": dept}
-        base = os.getenv("PUBLIC_BASE_URL") or ""
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(f"{base}/staff/create", json=payload)
-            msg = r.text[:2800]
-        # Post the result back to the channel
+        result = await create_staff_core(dept, names or None, None)
+        msg = "```" + (str(result)[:2900]) + "```"
         if channel_id:
             await slack_post_message(channel_id, f"Hiring request from @{user}:\n{msg}")
         return PlainTextResponse(f"Creating {dept} team… I’ll post results here.", status_code=200)
     except Exception as e:
-        # Post error to channel but still return 200 to Slack
         if channel_id:
             await slack_post_message(channel_id, f"Hiring failed: {e}")
         return PlainTextResponse("Hiring request received, but something went wrong. Check channel for details.", status_code=200)
@@ -307,11 +300,9 @@ from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, slack_pos
 from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, slack_post_message, HEADERS_SB, SUPABASE_URL
 
 @app.post("/staff/create", name="staff_create")
-async def staff_create(payload: StaffCreatePayload, req: Request):
-    try:
-        dept_name = (payload.department or "").strip()
-        if not dept_name:
-            return {"ok": False, "error": "department is required"}
+async def staff_create(payload: StaffCreatePayload):
+    result = await create_staff_core(payload.department, payload.employee_names, payload.slack_channel_id)
+    return result  # returns JSON with ok/department/director/employees or ok:false+error
 
         # 1) Department get/create
         dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
