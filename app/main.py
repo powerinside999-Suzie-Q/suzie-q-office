@@ -304,9 +304,9 @@ async def staff_create(payload: StaffCreatePayload):
     result = await create_staff_core(payload.department, payload.employee_names, payload.slack_channel_id)
     return result  # returns JSON with ok/department/director/employees or ok:false+error
 
-    # 1) Department get/create
-    dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
-    if not dep_row:
+        # 1) Department get/create
+        dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
+        if not dep_row:
          dep_row = await sb_insert_returning("departments", {
                 "name": dept_name,
                 "slack_channel_id": payload.slack_channel_id or None
