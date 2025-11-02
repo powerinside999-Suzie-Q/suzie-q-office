@@ -567,3 +567,94 @@ async def recall(payload: RecallPayload):
     })
     return {"ok": True, "matches": matches}
 
+# --- CORE: create staff for a department (shared by API & slash command) ---
+async def create_staff_core(dept_name: str, employee_names: list[str] | None, slack_channel_id: str | None):
+    from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, HEADERS_SB, SUPABASE_URL
+    import urllib.parse, httpx
+
+    dept_name = (dept_name or "").strip()
+    if not dept_name:
+        return {"ok": False, "error": "department is required"}
+
+    # 1) Department get/create
+    dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
+    if not dep_row:
+        dep_row = await sb_insert_returning("departments", {
+            "name": dept_name,
+            "slack_channel_id": slack_channel_id or None
+        })
+        if not dep_row:
+            return {"ok": False, "error": "Failed to create department (check SUPABASE_* env & pgcrypto extension)."}
+    department_id = dep_row["id"]
+
+    # 2) Director get/create
+    director_name = f"Director {dept_name.title()}"
+    dir_row = await sb_get_one(
+        "staff",
+        f"select=*&name=eq.{urllib.parse.quote(director_name)}&role=eq.Director&department_id=eq.{department_id}"
+    )
+    if not dir_row:
+        dir_row = await sb_insert_returning("staff", {
+            "name": director_name,
+            "role": "Director",
+            "department_id": department_id,
+            "status": "active",
+            "agent_webhook": agent_endpoint(dept_name, "Director", director_name)
+        })
+        if not dir_row:
+            return {"ok": False, "error": "Failed to create director (check Supabase)."}
+
+    # 3) Employees
+    count = 5 if not employee_names else max(1, len(employee_names))
+    if not employee_names or len(employee_names) == 0:
+        base_names = [f"{dept_name.title()} Employee {i}" for i in range(1, 6)]
+    else:
+        base_names = employee_names
+
+    employee_rows = []
+    for nm in base_names:
+        er = await sb_get_one(
+            "staff",
+            f"select=*&name=eq.{urllib.parse.quote(nm)}&role=eq.Employee&department_id=eq.{department_id}"
+        )
+        if not er:
+            er = await sb_insert_returning("staff", {
+                "name": nm,
+                "role": "Employee",
+                "department_id": department_id,
+                "status": "active",
+                "agent_webhook": agent_endpoint(dept_name, "Employee", nm)
+            })
+            if not er:
+                return {"ok": False, "error": f"Failed to create employee: {nm}"}
+        employee_rows.append(er)
+
+    # 4) Reporting lines
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
+            for er in employee_rows:
+                existing = await sb_get_one(
+                    "reporting_lines",
+                    f"select=*&manager_id=eq.{dir_row['id']}&report_id=eq.{er['id']}"
+                )
+                if not existing:
+                    r = await c.post(f"{SUPABASE_URL}/rest/v1/reporting_lines", json={
+                        "manager_id": dir_row["id"],
+                        "report_id": er["id"]
+                    })
+                    if r.status_code >= 400:
+                        return {"ok": False, "error": f"reporting_lines insert failed: {r.text}"}
+    except Exception as e:
+        return {"ok": False, "error": f"reporting_lines error: {e}"}
+
+    return {
+        "ok": True,
+        "department": {"id": department_id, "name": dept_name},
+        "director": {
+            "id": dir_row["id"], "name": director_name, "agent_url": dir_row.get("agent_webhook")
+        },
+        "employees": [
+            {"id": er["id"], "name": er["name"], "agent_url": er.get("agent_webhook")}
+            for er in employee_rows
+        ],
+    }
