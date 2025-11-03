@@ -1,7 +1,8 @@
+# app/schemas.py
+from typing import Optional, Any, Dict, List
+from pydantic import BaseModel, Field
 
-from pydantic import BaseModel
-from typing import Optional, Any, Dict
-
+# ---------- Slack & Telegram ----------
 class SlackEvent(BaseModel):
     token: Optional[str] = None
     team_id: Optional[str] = None
@@ -13,31 +14,35 @@ class SlackEvent(BaseModel):
 class TelegramUpdate(BaseModel):
     update_id: Optional[int] = None
     message: Optional[Dict[str, Any]] = None
+    edited_message: Optional[Dict[str, Any]] = None
+    channel_post: Optional[Dict[str, Any]] = None
+    edited_channel_post: Optional[Dict[str, Any]] = None
 
+# ---------- Agent invoke ----------
 class AgentInvokePayload(BaseModel):
     text: Optional[str] = None
     context: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-from pydantic import BaseModel
-from typing import Optional, Any, Dict, List
 
+# ---------- Memory ----------
 class RememberPayload(BaseModel):
     content: str
     tags: Optional[List[str]] = None
-    importance: Optional[int] = 1
+    importance: Optional[int] = Field(default=1, ge=1, le=5)
     source: Optional[str] = None
     department: Optional[str] = None
     actor: Optional[str] = None
 
 class RecallPayload(BaseModel):
     query: str
-    top_k: Optional[int] = 8
-    min_similarity: Optional[float] = 0.15
+    top_k: Optional[int] = Field(default=8, ge=1, le=50)
+    min_similarity: Optional[float] = Field(default=0.15, ge=0.0, le=1.0)
     department: Optional[str] = None
 
+# ---------- Staff ----------
 class StaffCreatePayload(BaseModel):
     department: str
-    employees_count: Optional[int] = 5
+    employees_count: Optional[int] = Field(default=5, ge=1, le=50)
     employee_names: Optional[List[str]] = None  # if not given, auto-generate
     create_channel: Optional[bool] = False
     slack_channel_id: Optional[str] = None      # if you already made a #dept-... channel
