@@ -1,14 +1,14 @@
-# app/main.py
+# app/main.py — full, cleaned
+
 import os
+import json
+import urllib.parse
+from typing import Optional, List
+
 import httpx
-from urllib.parse import parse_qs
-from fastapi.responses import PlainTextResponse
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
-from typing import Optional
-import os
-import httpx, os, urllib.parse, json
-from fastapi.responses import PlainTextResponse
+from urllib.parse import parse_qs
 
 from app.schemas import (
     SlackEvent,
@@ -16,7 +16,10 @@ from app.schemas import (
     AgentInvokePayload,
     RememberPayload,
     RecallPayload,
+    StaffCreatePayload,
+    StaffDeletePayload,
 )
+
 from app.utils import (
     call_brain,
     embed_text,
@@ -26,13 +29,19 @@ from app.utils import (
     slack_post_message,
     telegram_send_message,
     now_utc_iso,
+    sb_get_one,
+    sb_insert_returning,
+    agent_endpoint,
+    importance_score,            # <-- needed for /memory/remember
+    HEADERS_SB,
+    SUPABASE_URL,
 )
 
 CEO_CHANNEL = os.getenv("CEO_SLACK_CHANNEL_ID", "")  # e.g., C0XXXXXXX
 
 app = FastAPI(title="Suzie Q – Office")
 
-# ------------- Root & Health -------------
+# ---------------- Root & Health ----------------
 @app.get("/")
 def root():
     return {"message": "Suzie Q Office is running"}
@@ -41,19 +50,13 @@ def root():
 def health():
     return {"ok": True}
 
-# ------------- Slack Events (GET + POST) -------------
+# ---------------- Slack Events (GET + POST) ----------------
 @app.get("/slack/events")
 def slack_events_get():
-    # Convenience: lets you hit the route in a browser without a 405
     return PlainTextResponse("Slack Events endpoint. Use POST.", status_code=200)
 
 @app.post("/slack/events")
 async def slack_events(req: Request):
-    """
-    Handles Slack Event Subscriptions (POST JSON).
-    - URL verification returns challenge
-    - app_mention / message events: recall memory -> call brain -> reply -> log memory
-    """
     body = await req.json()
 
     # URL verification
@@ -61,29 +64,27 @@ async def slack_events(req: Request):
         return JSONResponse({"challenge": body.get("challenge", "")})
 
     ev = SlackEvent(**body)
-    event = (ev.event or {})
+    event = ev.event or {}
     if event.get("bot_id"):
-        # ignore the bot's own posts
         return {"ok": True}
 
     text = event.get("text") or ""
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
 
-    # Try to recall relevant memory first (global, not dept-filtered)
+    # Ranked memory recall (global)
     memory_snips = ""
     try:
         q_emb = await embed_text(text)
         matches = await supabase_rpc("match_long_term_memory_ranked", {
-    "query_embedding": q_emb,
-    "match_count": 6,
-    "dept": None,                 # or dept for agents route
-    "min_cosine_similarity": 0.20,
-    "half_life_days": 14.0,       # tune: smaller = favor fresher memories
-    "alpha": 0.6,                 # weight for importance
-    "beta": 0.3                   # weight for frequency
-}) or []
-
+            "query_embedding": q_emb,
+            "match_count": 6,
+            "dept": None,
+            "min_cosine_similarity": 0.20,
+            "half_life_days": 14.0,
+            "alpha": 0.6,
+            "beta": 0.3,
+        }) or []
         memory_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         memory_snips = ""
@@ -95,11 +96,9 @@ async def slack_events(req: Request):
 
     decision = await call_brain(prompt)
 
-    # Post back to Slack (threaded when possible)
     if channel:
         await slack_post_message(channel, decision, thread_ts=thread_ts)
 
-    # Log to memory table (short-term activity log)
     await supabase_insert("memory", {
         "context": text,
         "decision": decision,
@@ -108,9 +107,7 @@ async def slack_events(req: Request):
     })
     return {"ok": True}
 
-from urllib.parse import parse_qs
-from fastapi.responses import PlainTextResponse
-
+# ---------------- Slack Slash Commands ----------------
 @app.post("/slack/commands/hire")
 async def slack_hire(req: Request):
     body = await req.body()
@@ -124,13 +121,11 @@ async def slack_hire(req: Request):
 
     dept, *names = text.split()
 
-    # Fast ACK so Slack doesn't 'dispatch_failed'
-    # Then do the work and post results to the channel.
     try:
         result = await create_staff_core(dept, names or None, None)
-        msg = "```" + (str(result)[:2900]) + "```"
+        pretty = json.dumps(result, indent=2)
         if channel_id:
-            await slack_post_message(channel_id, f"Hiring request from @{user}:\n{msg}")
+            await slack_post_message(channel_id, f"Hiring request from @{user}:\n```{pretty[:2900]}```")
         return PlainTextResponse(f"Creating {dept} team… I’ll post results here.", status_code=200)
     except Exception as e:
         if channel_id:
@@ -141,34 +136,60 @@ async def slack_hire(req: Request):
 async def slack_memory(req: Request):
     body = await req.body()
     data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-    text = data.get("text", "").strip()
+    text = (data.get("text") or "").strip()
+
     if text.lower().startswith("remember "):
         note = text[len("remember "):]
-        await httpx.AsyncClient().post(f"{os.getenv('PUBLIC_BASE_URL')}/memory/remember",
-                                       json={"content": note})
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                await c.post(f"{os.getenv('PUBLIC_BASE_URL')}/memory/remember", json={"content": note})
+        except Exception:
+            # Fallback to direct call without HTTP if PUBLIC_BASE_URL missing
+            emb = await embed_text(note)
+            imp = await importance_score(note)
+            await supabase_insert("long_term_memory", {
+                "content": note,
+                "embedding": emb,
+                "tags": [],
+                "importance": imp,
+                "source": "slack",
+                "department": None,
+                "actor": "CEO",
+                "created_at": now_utc_iso(),
+            })
         return PlainTextResponse("Noted in long-term memory.", status_code=200)
+
     elif text.lower().startswith("recall "):
         query = text[len("recall "):]
-        r = await httpx.AsyncClient().post(f"{os.getenv('PUBLIC_BASE_URL')}/memory/recall",
-                                           json={"query": query, "top_k": 5})
-        return PlainTextResponse(r.text[:2800], status_code=200)
-    return PlainTextResponse("Usage: /memory remember <text> | recall <query>", status_code=200)
+        emb = await embed_text(query)
+        matches = await supabase_rpc("match_long_term_memory_ranked", {
+            "query_embedding": emb,
+            "match_count": 5,
+            "dept": None,
+            "min_cosine_similarity": 0.15,
+            "half_life_days": 14.0,
+            "alpha": 0.6,
+            "beta": 0.3,
+        }) or []
+        pretty = json.dumps(matches, indent=2)
+        return PlainTextResponse(pretty[:2800], status_code=200)
 
+    return PlainTextResponse("Usage: /memory remember <text> | recall <query>", status_code=200)
 
 @app.post("/slack/commands/ask")
 async def slack_ask(req: Request):
     body = await req.body()
     data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-    question = data.get("text", "").strip()
+    question = (data.get("text") or "").strip()
     channel_id = data.get("channel_id")
     if not question:
         return PlainTextResponse("Usage: /ask <question>", status_code=200)
     decision = await call_brain(f"CEO mode: {question}")
-    await slack_post_message(channel_id, decision)
+    if channel_id:
+        await slack_post_message(channel_id, decision)
     return PlainTextResponse("Sent to Suzie Q...", status_code=200)
 
-
-# ------------- Slack Slash Commands (form-encoded) -------------
+# Generic echo if you registered /slack/commands without a subpath
 @app.post("/slack/commands")
 async def slack_commands(
     command: str = Form(None),
@@ -179,47 +200,38 @@ async def slack_commands(
     token: str = Form(None),
     team_id: str = Form(None),
 ):
-    """
-    Handles Slack Slash Commands (POST form-encoded).
-    Set your command's Request URL to /slack/commands.
-    """
-    # Minimal echo to confirm wiring; expand with routing as needed
     reply = f"Command: {command or ''}\nArgs: {text or ''}"
     return PlainTextResponse(reply, status_code=200)
 
-# ------------- Telegram Webhook -------------
+# ---------------- Telegram Webhook ----------------
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: dict):
-    # 1) Extract chat_id & text safely from multiple update types
     msg = update.get("message") or update.get("edited_message") or \
           update.get("channel_post") or update.get("edited_channel_post") or {}
-    chat = (msg.get("chat") or {})
+    chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     text = (msg.get("text") or "").strip()
 
-    # If we can't reply (no chat), just 200 OK so Telegram stops retrying
     if not chat_id:
         return {"ok": True}
 
-    # 2) Try recall + brain, but never crash if they fail
-    decision = None
-
-    # Optional recall (safe-wrap)
     memory_snips = ""
     try:
         if text:
             q_emb = await embed_text(text)
-            matches = await supabase_rpc("match_long_term_memory", {
+            matches = await supabase_rpc("match_long_term_memory_ranked", {
                 "query_embedding": q_emb,
                 "match_count": 6,
                 "min_cosine_similarity": 0.20,
                 "dept": None,
+                "half_life_days": 14.0,
+                "alpha": 0.6,
+                "beta": 0.3,
             }) or []
             memory_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         memory_snips = ""
 
-    # Call brain (safe-wrap)
     try:
         prefix = "You are Suzie Q (CEO). Use relevant memory when helpful.\n"
         if memory_snips:
@@ -227,16 +239,13 @@ async def telegram_webhook(update: dict):
         prompt = prefix + f"User: {text or 'Respond briefly and introduce yourself.'}"
         decision = await call_brain(prompt)
     except Exception:
-        # Fallback if brain is down
         decision = "Hi! I’m Suzie Q. I’m online via Telegram. How can I help right now?"
 
-    # 3) Send reply (safe-wrap: don’t crash if token missing)
     try:
         await telegram_send_message(chat_id, decision or "Okay!")
     except Exception:
         pass
 
-    # 4) Log memory (safe-wrap)
     try:
         await supabase_insert("memory", {
             "context": text,
@@ -249,28 +258,23 @@ async def telegram_webhook(update: dict):
 
     return {"ok": True}
 
-# ------------- Agents (Directors/Employees) -------------
+# ---------------- Agents (Directors/Employees) ----------------
 @app.post("/agents/{dept}/{role}/{name}")
 async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayload):
-    """
-    Department-specialized agent endpoint.
-    """
     text = (payload.text or payload.context) or ""
 
-    # Department-filtered recall
     mem_snips = ""
     try:
         q_emb = await embed_text(text)
         matches = await supabase_rpc("match_long_term_memory_ranked", {
-    "query_embedding": q_emb,
-    "match_count": 6,
-    "dept": None,                 # or dept for agents route
-    "min_cosine_similarity": 0.20,
-    "half_life_days": 14.0,       # tune: smaller = favor fresher memories
-    "alpha": 0.6,                 # weight for importance
-    "beta": 0.3                   # weight for frequency
-}) or []
-
+            "query_embedding": q_emb,
+            "match_count": 6,
+            "dept": dept,
+            "min_cosine_similarity": 0.20,
+            "half_life_days": 14.0,
+            "alpha": 0.6,
+            "beta": 0.3,
+        }) or []
         mem_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         mem_snips = ""
@@ -294,128 +298,15 @@ async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayl
         "actor": name,
     })
     return {"agent": name, "role": role, "dept": dept, "decision": decision}
-from app.schemas import StaffCreatePayload, StaffDeletePayload
-from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, slack_post_message
 
-from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, slack_post_message, HEADERS_SB, SUPABASE_URL
-
+# ---------------- Staff APIs ----------------
 @app.post("/staff/create", name="staff_create")
 async def staff_create(payload: StaffCreatePayload):
     result = await create_staff_core(payload.department, payload.employee_names, payload.slack_channel_id)
-    return result  # returns JSON with ok/department/director/employees or ok:false+error
-
-        # 1) Department get/create
-        dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
-        if not dep_row:
-         dep_row = await sb_insert_returning("departments", {
-                "name": dept_name,
-                "slack_channel_id": payload.slack_channel_id or None
-            })
-        department_id = dep_row["id"]
-
-        # 2) Director get/create
-        director_name = f"Director {dept_name.title()}"
-        dir_row = await sb_get_one("staff",
-            f"select=*&name=eq.{urllib.parse.quote(director_name)}&role=eq.Director&department_id=eq.{department_id}"
-        )
-        if not dir_row:
-            dir_row = await sb_insert_returning("staff", {
-                "name": director_name,
-                "role": "Director",
-                "department_id": department_id,
-                "status": "active",
-                "agent_webhook": agent_endpoint(dept_name, "Director", director_name)
-            })
-
-        # 3) Employees
-        count = max(1, payload.employees_count or 5)
-        if payload.employee_names:
-            base_names = payload.employee_names[:count]
-            if len(base_names) < count:
-                base_names += [f"{dept_name.title()} Employee {i}" for i in range(len(base_names)+1, count+1)]
-        else:
-            base_names = [f"{dept_name.title()} Employee {i}" for i in range(1, count+1)]
-
-        employee_rows = []
-        for nm in base_names:
-            er = await sb_get_one("staff",
-                f"select=*&name=eq.{urllib.parse.quote(nm)}&role=eq.Employee&department_id=eq.{department_id}"
-            )
-            if not er:
-                er = await sb_insert_returning("staff", {
-                    "name": nm,
-                    "role": "Employee",
-                    "department_id": department_id,
-                    "status": "active",
-                    "agent_webhook": agent_endpoint(dept_name, "Employee", nm)
-                })
-            employee_rows.append(er)
-
-        # 4) Reporting lines
-        async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
-            for er in employee_rows:
-                # skip if exists
-                existing = await sb_get_one("reporting_lines",
-                    f"select=*&manager_id=eq.{dir_row['id']}&report_id=eq.{er['id']}"
-                )
-                if not existing:
-                    r = await c.post(f"{SUPABASE_URL}/rest/v1/reporting_lines", json={
-                        "manager_id": dir_row["id"],
-                        "report_id": er["id"]
-                    })
-                    if r.status_code >= 400:
-                        return {"ok": False, "error": f"reporting_lines insert failed: {r.text}"}
-
-        # 5) OK
-        return {
-            "ok": True,
-            "department": {"id": department_id, "name": dept_name},
-            "director": {
-                "id": dir_row["id"], "name": director_name, "agent_url": dir_row.get("agent_webhook")
-            },
-            "employees": [
-                {"id": er["id"], "name": er["name"], "agent_url": er.get("agent_webhook")}
-                for er in employee_rows
-            ],
-        }
-    except httpx.HTTPStatusError as e:
-        # Bubble up Supabase error body
-        return {"ok": False, "error": f"Supabase status error: {e.response.status_code} {e.response.text}"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-
-    # 5) Optional: announce in Slack CEO channel
-    ceo_channel = os.getenv("CEO_SLACK_CHANNEL_ID", "")
-    if ceo_channel:
-        try:
-            lines = [
-                f"Department **{dept_name}** ready.",
-                f"Director: {director_name} → {dir_row.get('agent_webhook','')}",
-            ] + [f"Employee: {er['name']} → {er.get('agent_webhook','')}" for er in employee_rows]
-            await slack_post_message(ceo_channel, "\n".join(lines))
-        except Exception:
-            pass
-
-    return {
-        "ok": True,
-        "department": {"id": department_id, "name": dept_name},
-        "director": {
-            "id": dir_row["id"],
-            "name": director_name,
-            "agent_url": dir_row.get("agent_webhook")
-        },
-        "employees": [
-            {"id": er["id"], "name": er["name"], "agent_url": er.get("agent_webhook")}
-            for er in employee_rows
-        ],
-    }
+    return result
 
 @app.get("/staff/list")
 async def staff_list(department: Optional[str] = None):
-    """
-    List staff (optionally by department name).
-    """
     if department:
         dep = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(department)}")
         if not dep:
@@ -428,34 +319,20 @@ async def staff_list(department: Optional[str] = None):
 
 @app.post("/staff/delete")
 async def staff_delete(payload: StaffDeletePayload):
-    """
-    Soft-delete (deactivate) a staff member by id.
-    """
-    # Soft delete by status=inactive (safer than hard delete)
     if not SUPABASE_URL:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     async with httpx.AsyncClient(timeout=60, headers=HEADERS_SB) as client:
-        # Patch-like behavior using 'Prefer: resolution=merge-duplicates' requires UPSERT constraints.
-        # Here we use RPC-free update via ?id=eq. filter.
         r = await client.patch(
             f"{SUPABASE_URL}/rest/v1/staff?id=eq.{payload.staff_id}",
             json={"status": "inactive"},
         )
-        # Some Supabase setups require headers["Prefer"] = "return=representation"
-        # but we don't need the body here.
         if r.status_code >= 400:
             raise HTTPException(status_code=500, detail=f"Supabase update failed: {r.text}")
     return {"ok": True}
 
-
-# ------------- Simple Department Router (optional) -------------
+# ---------------- Simple Department Router (optional) ----------------
 @app.post("/route/{dept}")
 async def route_to_department(dept: str, request: Request):
-    """
-    Minimal router:
-    Input JSON: {text, channel?, thread_ts?, target?}
-    target: "director" or "employee-3" (freeform label)
-    """
     body = await request.json()
     text: str = body.get("text") or ""
     channel: Optional[str] = body.get("channel")
@@ -465,15 +342,17 @@ async def route_to_department(dept: str, request: Request):
     role = "Director" if (not target or target.lower() == "director") else "Employee"
     name = f"{dept.title()} {target.title()}" if target else f"Director {dept.title()}"
 
-    # Dept recall
     mem_snips = ""
     try:
         q_emb = await embed_text(text)
-        matches = await supabase_rpc("match_long_term_memory", {
+        matches = await supabase_rpc("match_long_term_memory_ranked", {
             "query_embedding": q_emb,
             "match_count": 6,
             "min_cosine_similarity": 0.20,
             "dept": dept,
+            "half_life_days": 14.0,
+            "alpha": 0.6,
+            "beta": 0.3,
         }) or []
         mem_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
@@ -503,13 +382,9 @@ async def route_to_department(dept: str, request: Request):
 
     return {"dept": dept, "target": target or "director", "decision": decision}
 
-# ------------- Daily CEO Report -------------
+# ---------------- Daily CEO Report ----------------
 @app.post("/cron/daily-report")
 async def daily_report():
-    """
-    Summarize last ~200 entries from memory (you can filter by timestamp on Supabase).
-    Post to CEO Slack channel if configured.
-    """
     records = await supabase_select("memory", "select=*&order=timestamp.desc&limit=200") or []
     context = "Summarize the last 24 hours of Suzie Q operations into an executive report with KPIs and next actions.\n"
     for r in records:
@@ -529,11 +404,11 @@ async def daily_report():
     })
     return {"ok": True, "summary": decision}
 
-# ------------- Memory API (vector) -------------
+# ---------------- Memory API (vector) ----------------
 @app.post("/memory/remember")
 async def remember(payload: RememberPayload):
     emb = await embed_text(payload.content)
-    imp = payload.importance if payload.importance and 1 <= payload.importance <= 5 else await importance_score(payload.content)
+    imp = payload.importance if (payload.importance and 1 <= payload.importance <= 5) else await importance_score(payload.content)
     row = {
         "content": payload.content,
         "embedding": emb,
@@ -550,24 +425,24 @@ async def remember(payload: RememberPayload):
 @app.post("/memory/recall")
 async def recall(payload: RecallPayload):
     emb = await embed_text(payload.query)
-    matches = await supabase_rpc("match_long_term_memory", {
+    matches = await supabase_rpc("match_long_term_memory_ranked", {
         "query_embedding": emb,
         "match_count": payload.top_k,
         "min_cosine_similarity": payload.min_similarity,
         "dept": payload.department,
+        "half_life_days": 14.0,
+        "alpha": 0.6,
+        "beta": 0.3,
     })
     return {"ok": True, "matches": matches}
 
-# --- CORE: create staff for a department (shared by API & slash command) ---
-async def create_staff_core(dept_name: str, employee_names: list[str] | None, slack_channel_id: str | None):
-    from app.utils import sb_get_one, sb_insert_returning, agent_endpoint, HEADERS_SB, SUPABASE_URL
-    import urllib.parse, httpx
-
+# ---------------- CORE: create staff (shared) ----------------
+async def create_staff_core(dept_name: str, employee_names: Optional[List[str]], slack_channel_id: Optional[str]):
     dept_name = (dept_name or "").strip()
     if not dept_name:
         return {"ok": False, "error": "department is required"}
 
-    # 1) Department get/create
+    # Department get/create
     dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
     if not dep_row:
         dep_row = await sb_insert_returning("departments", {
@@ -578,7 +453,7 @@ async def create_staff_core(dept_name: str, employee_names: list[str] | None, sl
             return {"ok": False, "error": "Failed to create department (check SUPABASE_* env & pgcrypto extension)."}
     department_id = dep_row["id"]
 
-    # 2) Director get/create
+    # Director get/create
     director_name = f"Director {dept_name.title()}"
     dir_row = await sb_get_one(
         "staff",
@@ -595,12 +470,12 @@ async def create_staff_core(dept_name: str, employee_names: list[str] | None, sl
         if not dir_row:
             return {"ok": False, "error": "Failed to create director (check Supabase)."}
 
-    # 3) Employees
-    count = 5 if not employee_names else max(1, len(employee_names))
-    if not employee_names or len(employee_names) == 0:
-        base_names = [f"{dept_name.title()} Employee {i}" for i in range(1, 6)]
-    else:
+    # Employees
+    base_names: List[str]
+    if employee_names and len(employee_names) > 0:
         base_names = employee_names
+    else:
+        base_names = [f"{dept_name.title()} Employee {i}" for i in range(1, 6)]
 
     employee_rows = []
     for nm in base_names:
@@ -620,7 +495,7 @@ async def create_staff_core(dept_name: str, employee_names: list[str] | None, sl
                 return {"ok": False, "error": f"Failed to create employee: {nm}"}
         employee_rows.append(er)
 
-    # 4) Reporting lines
+    # Reporting lines
     try:
         async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
             for er in employee_rows:
@@ -649,3 +524,4 @@ async def create_staff_core(dept_name: str, employee_names: list[str] | None, sl
             for er in employee_rows
         ],
     }
+
