@@ -1,3 +1,4 @@
+# app/utils.py
 import os
 import httpx
 import urllib.parse
@@ -110,7 +111,6 @@ async def supabase_rpc(function: str, payload: Dict[str, Any]) -> List[Dict[str,
     async with httpx.AsyncClient(timeout=60, headers=HEADERS_SB) as client:
         r = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/{function}", json=payload)
         r.raise_for_status()
-        # Some RPCs return an object; normalize to list
         data = r.json()
         if isinstance(data, list):
             return data
@@ -173,5 +173,7 @@ async def telegram_send_message(chat_id: int, text: str) -> None:
         await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text},
+        )
+
         )
 
