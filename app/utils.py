@@ -16,8 +16,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "America/Los_Angeles")
 
 # Embedding model must match your Supabase vector dims:
-# - text-embedding-3-large => 3072 dims
-# - text-embedding-3-small => 1536 dims
+# - text-embedding-3-large => 3072
+# - text-embedding-3-small => 1536
 EMBED_MODEL = "text-embedding-3-large"
 
 HEADERS_SB = {
@@ -72,7 +72,6 @@ async def importance_score(text: str) -> int:
             })
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"].strip()
-        # Extract first integer found
         digits = "".join(ch for ch in content if ch.isdigit())
         n = int(digits) if digits else 2
         return max(1, min(5, n))
@@ -112,9 +111,7 @@ async def supabase_rpc(function: str, payload: Dict[str, Any]) -> List[Dict[str,
         r = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/{function}", json=payload)
         r.raise_for_status()
         data = r.json()
-        if isinstance(data, list):
-            return data
-        return [data]
+        return data if isinstance(data, list) else [data]
 
 async def sb_get_one(table: str, filter_qs: str) -> Optional[Dict[str, Any]]:
     """
@@ -174,6 +171,3 @@ async def telegram_send_message(chat_id: int, text: str) -> None:
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text},
         )
-
-        )
-
