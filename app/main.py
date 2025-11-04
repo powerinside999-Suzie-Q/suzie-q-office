@@ -525,3 +525,74 @@ async def create_staff_core(dept_name: str, employee_names: Optional[List[str]],
         ],
     }
 
+from app.schemas import RnDBootstrapPayload, RnDProjectCreate, RnDExperimentCreate, IngestWebPayload
+
+@app.post("/rnd/bootstrap")
+async def rnd_bootstrap(payload: RnDBootstrapPayload):
+    dept = payload.department.strip()
+    n = max(2, min(12, payload.researchers or 5))  # cap reasonable team size
+
+    # Create/get Director of R&D
+    director_name = f"Director R&D {dept.title()}"
+    dir_row = await sb_get_one(
+        "staff",
+        f"select=*&name=eq.{urllib.parse.quote(director_name)}&role=eq.Director&department_id=eq.null"  # let’s create under department row
+    )
+
+    # ensure department row
+    dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept)}")
+    if not dep_row:
+        dep_row = await sb_insert_returning("departments", {"name": dept})
+    dep_id = dep_row["id"]
+
+    if not dir_row:
+        dir_row = await sb_insert_returning("staff", {
+            "name": director_name,
+            "role": "Director",
+            "department_id": dep_id,
+            "status": "active",
+            "agent_webhook": agent_endpoint(dept, "Director", director_name)
+        })
+
+    # Create N researchers
+    researchers = []
+    for i in range(1, n + 1):
+        name = f"{dept.title()} R&D Researcher {i}"
+        r = await sb_get_one(
+            "staff",
+            f"select=*&name=eq.{urllib.parse.quote(name)}&role=eq.Employee&department_id=eq.{dep_id}"
+        )
+        if not r:
+            r = await sb_insert_returning("staff", {
+                "name": name,
+                "role": "Employee",
+                "department_id": dep_id,
+                "status": "active",
+                "agent_webhook": agent_endpoint(dept, "Employee", name)
+            })
+        researchers.append(r)
+
+    # Reporting lines to Director
+    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
+        for er in researchers:
+            exists = await sb_get_one(
+                "reporting_lines",
+                f"select=*&manager_id=eq.{dir_row['id']}&report_id=eq.{er['id']}"
+            )
+            if not exists:
+                r = await c.post(f"{SUPABASE_URL}/rest/v1/reporting_lines", json={
+                    "manager_id": dir_row["id"],
+                    "report_id": er["id"]
+                })
+                if r.status_code >= 400:
+                    return {"ok": False, "error": f"reporting_lines failed: {r.text}"}
+
+    return {
+        "ok": True,
+        "department": dept,
+        "director": {"id": dir_row["id"], "name": dir_row["name"], "agent_url": dir_row.get("agent_webhook")},
+        "researchers": [
+            {"id": r["id"], "name": r["name"], "agent_url": r.get("agent_webhook")}
+            for r in researchers
+        ]
+    }
