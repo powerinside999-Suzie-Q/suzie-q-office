@@ -52,3 +52,22 @@ class StaffListQuery(BaseModel):
 
 class StaffDeletePayload(BaseModel):
     staff_id: str  # uuid of the staff member to deactivate/fire
+
+class RnDBootstrapPayload(BaseModel):
+    department: str
+    researchers: Optional[int] = 5  # Director+N researchers
+
+class RnDProjectCreate(BaseModel):
+    department: str
+    title: str
+    goal: Optional[str] = None
+
+class RnDExperimentCreate(BaseModel):
+    project_id: str
+    hypothesis: str
+    method: Optional[str] = None
+    metrics: Optional[List[Dict[str, Any]]] = None  # [{"name":..., "target":...}]
+
+class IngestWebPayload(BaseModel):
+    department: str
+    url: str
