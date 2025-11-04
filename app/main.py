@@ -596,3 +596,194 @@ async def rnd_bootstrap(payload: RnDBootstrapPayload):
             for r in researchers
         ]
     }
+
+@app.post("/rnd/project")
+async def rnd_project_create(payload: RnDProjectCreate):
+    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_projects", json={
+            "department": payload.department,
+            "title": payload.title,
+            "goal": payload.goal
+        })
+        if r.status_code >= 400:
+            raise HTTPException(status_code=500, detail=r.text)
+        return {"ok": True, "project": r.json()[0]}
+
+@app.post("/rnd/experiment")
+async def rnd_experiment_create(payload: RnDExperimentCreate):
+    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_experiments", json={
+            "project_id": payload.project_id,
+            "hypothesis": payload.hypothesis,
+            "method": payload.method,
+            "metrics": payload.metrics or []
+        })
+        if r.status_code >= 400:
+            raise HTTPException(status_code=500, detail=r.text)
+        return {"ok": True, "experiment": r.json()[0]}
+
+@app.post("/rnd/ingest/web")
+async def ingest_web(payload: IngestWebPayload):
+    # very simple reader: fetch text and store; later you can add readability/Boilerpipe
+    try:
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.get(payload.url)
+            r.raise_for_status()
+            text = r.text
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Fetch failed: {e}")
+
+    title = payload.url[:120]
+    content = text[:6000]  # keep it manageable
+
+    # write to knowledge
+    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_knowledge", json={
+            "department": payload.department,
+            "source_url": payload.url,
+            "title": title,
+            "content": content,
+            "tags": ["web_ingest"]
+        })
+        r.raise_for_status()
+
+    # add to vector memory so Suzie can recall it later
+    emb = await embed_text(f"{title}\n{content[:2000]}")
+    await supabase_insert("long_term_memory", {
+        "content": f"[{payload.department} R&D] {title}\n{payload.url}",
+        "embedding": emb,
+        "tags": ["rnd", payload.department, "web"],
+        "importance": 3,
+        "source": "ingest:web",
+        "department": payload.department,
+        "actor": "R&D Ingestion",
+        "created_at": now_utc_iso(),
+    })
+
+    return {"ok": True}
+
+import asyncio
+
+async def _post_channel(channel_id: str, text: str):
+    if channel_id:
+        await slack_post_message(channel_id, text)
+
+@app.post("/slack/commands/rnd")
+async def slack_rnd(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    channel_id = data.get("channel_id")
+    args = (data.get("text") or "").strip()
+
+    if not args:
+        return JSONResponse({"response_type":"ephemeral",
+                             "text":"Usage: /rnd <dept> bootstrap [N] | project \"Title\" \"Goal\" | experiment <projectId> \"Hypothesis\""}, status_code=200)
+
+    parts = args.split()
+    dept = parts[0]
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    async def run():
+        try:
+            if sub == "bootstrap":
+                n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
+                r = await rnd_bootstrap(RnDBootstrapPayload(department=dept, researchers=n))
+                await _post_channel(channel_id, f"R&D bootstrap for *{dept}*:\n```{json.dumps(r, indent=2)[:2900]}```")
+            elif sub == "project":
+                # Expect quoted title/goal after dept project
+                tail = args.split("project",1)[1].strip()
+                # naive split on quotes:
+                # "Title" "Goal"
+                try:
+                    title = tail.split('"')[1]
+                    goal = tail.split('"')[3] if len(tail.split('"'))>3 else None
+                except Exception:
+                    await _post_channel(channel_id, "Usage: /rnd <dept> project \"Title\" \"Goal(optional)\"")
+                    return
+                r = await rnd_project_create(RnDProjectCreate(department=dept, title=title, goal=goal))
+                await _post_channel(channel_id, f"Project created:\n```{json.dumps(r, indent=2)[:2900]}```")
+            elif sub == "experiment":
+                # /rnd <dept> experiment <projectId> "Hypothesis"
+                if len(parts) < 3:
+                    await _post_channel(channel_id, "Usage: /rnd <dept> experiment <projectId> \"Hypothesis\"")
+                    return
+                project_id = parts[2]
+                hypothesis = args.split(project_id,1)[1].strip()
+                try:
+                    hypothesis = hypothesis.split('"')[1]
+                except Exception:
+                    await _post_channel(channel_id, "Provide hypothesis in quotes.")
+                    return
+                r = await rnd_experiment_create(RnDExperimentCreate(project_id=project_id, hypothesis=hypothesis))
+                await _post_channel(channel_id, f"Experiment created:\n```{json.dumps(r, indent=2)[:2900]}```")
+            else:
+                await _post_channel(channel_id, "Subcommand not recognized. Try: bootstrap | project | experiment")
+        except Exception as e:
+            await _post_channel(channel_id, f"R&D command failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type":"ephemeral",
+                         "text": f"R&D command accepted for {dept}. I’ll post results here."}, status_code=200)
+
+@app.post("/slack/commands/ingest")
+async def slack_ingest(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    args = (data.get("text") or "").strip()
+    channel_id = data.get("channel_id")
+    if not args:
+        return JSONResponse({"response_type":"ephemeral","text":"Usage: /ingest <dept> web <url>"}, status_code=200)
+
+    parts = args.split()
+    if len(parts) < 3 or parts[1].lower() != "web":
+        return JSONResponse({"response_type":"ephemeral","text":"Usage: /ingest <dept> web <url>"}, status_code=200)
+    dept, _, url = parts[0], parts[1], parts[2]
+
+    async def run():
+        try:
+            r = await ingest_web(IngestWebPayload(department=dept, url=url))
+            await _post_channel(channel_id, f"Ingested into {dept} R&D knowledge:\n{url}")
+        except Exception as e:
+            await _post_channel(channel_id, f"Ingest failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type":"ephemeral","text":"On it. Fetching and storing."}, status_code=200)
+
+@app.post("/slack/commands/report")
+async def slack_report(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    args = (data.get("text") or "").strip()
+    channel_id = data.get("channel_id")
+
+    if not args:
+        return JSONResponse({"response_type":"ephemeral","text":"Usage: /report <dept> weekly"}, status_code=200)
+
+    parts = args.split()
+    dept = parts[0]
+    interval = parts[1].lower() if len(parts) > 1 else "weekly"
+
+    async def run():
+        try:
+            # pull recent activity
+            recents = await supabase_select("memory", f"select=*&department=eq.{urllib.parse.quote(dept)}&order=timestamp.desc&limit=200")
+            context = f"Create a {interval} R&D report for the {dept} department. Summarize projects, experiments, findings, and next actions.\n"
+            for r in recents or []:
+                c = r.get("context","")
+                d = r.get("decision","")
+                context += f"- Context: {c}\n  Decision: {d}\n"
+            summary = await call_brain(context)
+            await _post_channel(channel_id, f"[{dept} R&D {interval.title()} Report]\n{summary}")
+            await supabase_insert("memory", {
+                "context": f"[{dept} R&D] {interval} report",
+                "decision": summary,
+                "source": "report",
+                "department": dept,
+                "actor": "R&D Director",
+                "timestamp": now_utc_iso(),
+            })
+        except Exception as e:
+            await _post_channel(channel_id, f"Report failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type":"ephemeral","text":f"Generating {interval} report for {dept}."}, status_code=200)
