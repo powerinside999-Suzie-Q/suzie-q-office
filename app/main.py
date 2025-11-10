@@ -1,9 +1,9 @@
-# app/main.py — full, cleaned
-
+# app/main.py
 import os
 import json
+import asyncio
 import urllib.parse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import httpx
 from fastapi import FastAPI, Request, Form, HTTPException
@@ -18,6 +18,11 @@ from app.schemas import (
     RecallPayload,
     StaffCreatePayload,
     StaffDeletePayload,
+    # R&D
+    RnDBootstrapPayload,
+    RnDProjectCreate,
+    RnDExperimentCreate,
+    IngestWebPayload,
 )
 
 from app.utils import (
@@ -32,16 +37,19 @@ from app.utils import (
     sb_get_one,
     sb_insert_returning,
     agent_endpoint,
-    importance_score,            # <-- needed for /memory/remember
+    importance_score,
     HEADERS_SB,
     SUPABASE_URL,
 )
 
-CEO_CHANNEL = os.getenv("CEO_SLACK_CHANNEL_ID", "")  # e.g., C0XXXXXXX
+CEO_CHANNEL = os.getenv("CEO_SLACK_CHANNEL_ID", "")  # e.g. C0XXXXXXX
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 app = FastAPI(title="Suzie Q – Office")
 
-# ---------------- Root & Health ----------------
+# ------------------------------------------------------------
+# Root & Health
+# ------------------------------------------------------------
 @app.get("/")
 def root():
     return {"message": "Suzie Q Office is running"}
@@ -50,16 +58,32 @@ def root():
 def health():
     return {"ok": True}
 
-# ---------------- Slack Events (GET + POST) ----------------
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+async def _post_channel(channel_id: Optional[str], text: str, thread_ts: Optional[str] = None):
+    if channel_id:
+        await slack_post_message(channel_id, text, thread_ts=thread_ts)
+
+def _enc(s: str) -> str:
+    return urllib.parse.quote(s, safe="")
+
+# ------------------------------------------------------------
+# Slack Events (GET + POST)
+# ------------------------------------------------------------
 @app.get("/slack/events")
 def slack_events_get():
     return PlainTextResponse("Slack Events endpoint. Use POST.", status_code=200)
 
 @app.post("/slack/events")
 async def slack_events(req: Request):
+    """
+    Handles Slack Event Subscriptions (POST JSON).
+    - URL verification returns challenge
+    - app_mention / message events: recall memory -> call brain -> reply -> log memory
+    """
     body = await req.json()
 
-    # URL verification
     if body.get("type") == "url_verification":
         return JSONResponse({"challenge": body.get("challenge", "")})
 
@@ -75,17 +99,18 @@ async def slack_events(req: Request):
     # Ranked memory recall (global)
     memory_snips = ""
     try:
-        q_emb = await embed_text(text)
-        matches = await supabase_rpc("match_long_term_memory_ranked", {
-            "query_embedding": q_emb,
-            "match_count": 6,
-            "dept": None,
-            "min_cosine_similarity": 0.20,
-            "half_life_days": 14.0,
-            "alpha": 0.6,
-            "beta": 0.3,
-        }) or []
-        memory_snips = "\n".join([f"- {m['content']}" for m in matches])
+        if text:
+            q_emb = await embed_text(text)
+            matches = await supabase_rpc("match_long_term_memory_ranked", {
+                "query_embedding": q_emb,
+                "match_count": 6,
+                "dept": None,
+                "min_cosine_similarity": 0.20,
+                "half_life_days": 14.0,
+                "alpha": 0.6,
+                "beta": 0.3,
+            }) or []
+            memory_snips = "\n".join([f"- {m['content']}" for m in matches])
     except Exception:
         memory_snips = ""
 
@@ -107,7 +132,9 @@ async def slack_events(req: Request):
     })
     return {"ok": True}
 
-# ---------------- Slack Slash Commands ----------------
+# ------------------------------------------------------------
+# Slack Slash Commands (all instant-ACK + background work)
+# ------------------------------------------------------------
 @app.post("/slack/commands/hire")
 async def slack_hire(req: Request):
     body = await req.body()
@@ -117,20 +144,24 @@ async def slack_hire(req: Request):
     channel_id = data.get("channel_id")
 
     if not text:
-        return PlainTextResponse("Usage: /hire <department> [names...]", status_code=200)
+        return JSONResponse({"response_type": "ephemeral",
+                             "text": "Usage: /hire <department> [names...]"},
+                            status_code=200)
 
     dept, *names = text.split()
 
-    try:
-        result = await create_staff_core(dept, names or None, None)
-        pretty = json.dumps(result, indent=2)
-        if channel_id:
-            await slack_post_message(channel_id, f"Hiring request from @{user}:\n```{pretty[:2900]}```")
-        return PlainTextResponse(f"Creating {dept} team… I’ll post results here.", status_code=200)
-    except Exception as e:
-        if channel_id:
-            await slack_post_message(channel_id, f"Hiring failed: {e}")
-        return PlainTextResponse("Hiring request received, but something went wrong. Check channel for details.", status_code=200)
+    async def run():
+        try:
+            result = await create_staff_core(dept, names or None, None)
+            pretty = json.dumps(result, indent=2)
+            await _post_channel(channel_id, f"Hiring request from @{user}:\n```{pretty[:2900]}```")
+        except Exception as e:
+            await _post_channel(channel_id, f"Hiring failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type": "ephemeral",
+                         "text": f"Creating {dept} team… I’ll post results here."},
+                        status_code=200)
 
 @app.post("/slack/commands/memory")
 async def slack_memory(req: Request):
@@ -140,41 +171,54 @@ async def slack_memory(req: Request):
 
     if text.lower().startswith("remember "):
         note = text[len("remember "):]
-        try:
-            async with httpx.AsyncClient(timeout=25) as c:
-                await c.post(f"{os.getenv('PUBLIC_BASE_URL')}/memory/remember", json={"content": note})
-        except Exception:
-            # Fallback to direct call without HTTP if PUBLIC_BASE_URL missing
-            emb = await embed_text(note)
-            imp = await importance_score(note)
-            await supabase_insert("long_term_memory", {
-                "content": note,
-                "embedding": emb,
-                "tags": [],
-                "importance": imp,
-                "source": "slack",
-                "department": None,
-                "actor": "CEO",
-                "created_at": now_utc_iso(),
-            })
-        return PlainTextResponse("Noted in long-term memory.", status_code=200)
+
+        async def run():
+            try:
+                emb = await embed_text(note)
+                imp = await importance_score(note)
+                await supabase_insert("long_term_memory", {
+                    "content": note,
+                    "embedding": emb,
+                    "tags": [],
+                    "importance": imp,
+                    "source": "slack",
+                    "department": None,
+                    "actor": "CEO",
+                    "created_at": now_utc_iso(),
+                })
+            except Exception as e:
+                # We keep errors silent here to avoid Slack noise; check logs if needed
+                await asyncio.sleep(0)
+
+        asyncio.create_task(run())
+        return JSONResponse({"response_type": "ephemeral", "text": "Noted in long-term memory."}, status_code=200)
 
     elif text.lower().startswith("recall "):
         query = text[len("recall "):]
-        emb = await embed_text(query)
-        matches = await supabase_rpc("match_long_term_memory_ranked", {
-            "query_embedding": emb,
-            "match_count": 5,
-            "dept": None,
-            "min_cosine_similarity": 0.15,
-            "half_life_days": 14.0,
-            "alpha": 0.6,
-            "beta": 0.3,
-        }) or []
-        pretty = json.dumps(matches, indent=2)
-        return PlainTextResponse(pretty[:2800], status_code=200)
 
-    return PlainTextResponse("Usage: /memory remember <text> | recall <query>", status_code=200)
+        async def run():
+            try:
+                emb = await embed_text(query)
+                matches = await supabase_rpc("match_long_term_memory_ranked", {
+                    "query_embedding": emb,
+                    "match_count": 5,
+                    "dept": None,
+                    "min_cosine_similarity": 0.15,
+                    "half_life_days": 14.0,
+                    "alpha": 0.6,
+                    "beta": 0.3,
+                }) or []
+                pretty = json.dumps(matches, indent=2)
+                await _post_channel(data.get("channel_id"), f"Memory recall:\n```{pretty[:2900]}```")
+            except Exception as e:
+                await _post_channel(data.get("channel_id"), f"Recall failed: {e}")
+
+        asyncio.create_task(run())
+        return JSONResponse({"response_type": "ephemeral", "text": "Recalling… posting results."}, status_code=200)
+
+    return JSONResponse({"response_type": "ephemeral",
+                         "text": "Usage: /memory remember <text> | recall <query>"},
+                        status_code=200)
 
 @app.post("/slack/commands/ask")
 async def slack_ask(req: Request):
@@ -183,27 +227,153 @@ async def slack_ask(req: Request):
     question = (data.get("text") or "").strip()
     channel_id = data.get("channel_id")
     if not question:
-        return PlainTextResponse("Usage: /ask <question>", status_code=200)
-    decision = await call_brain(f"CEO mode: {question}")
-    if channel_id:
-        await slack_post_message(channel_id, decision)
-    return PlainTextResponse("Sent to Suzie Q...", status_code=200)
+        return JSONResponse({"response_type": "ephemeral",
+                             "text": "Usage: /ask <question>"},
+                            status_code=200)
 
-# Generic echo if you registered /slack/commands without a subpath
-@app.post("/slack/commands")
-async def slack_commands(
-    command: str = Form(None),
-    text: str = Form(None),
-    user_id: str = Form(None),
-    channel_id: str = Form(None),
-    response_url: str = Form(None),
-    token: str = Form(None),
-    team_id: str = Form(None),
-):
-    reply = f"Command: {command or ''}\nArgs: {text or ''}"
-    return PlainTextResponse(reply, status_code=200)
+    async def run():
+        try:
+            decision = await call_brain(f"CEO mode: {question}")
+            await _post_channel(channel_id, decision)
+        except Exception as e:
+            await _post_channel(channel_id, f"/ask failed: {e}")
 
-# ---------------- Telegram Webhook ----------------
+    asyncio.create_task(run())
+    return JSONResponse({"response_type": "ephemeral", "text": "Sent to Suzie Q…"}, status_code=200)
+
+# ---------- R&D / Ingest / Report (Slack commands) ----------
+@app.post("/slack/commands/rnd")
+async def slack_rnd(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    channel_id = data.get("channel_id")
+    args = (data.get("text") or "").strip()
+
+    if not args:
+        return JSONResponse({"response_type": "ephemeral",
+                             "text": "Usage: /rnd <dept> bootstrap [N] | project \"Title\" \"Goal\" | experiment <projectId> \"Hypothesis\""},
+                            status_code=200)
+
+    parts = args.split()
+    dept = parts[0]
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    async def run():
+        try:
+            if sub == "bootstrap":
+                n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
+                res = await rnd_bootstrap(RnDBootstrapPayload(department=dept, researchers=n))
+                await _post_channel(channel_id, f"R&D bootstrap for *{dept}*:\n```{json.dumps(res, indent=2)[:2900]}```")
+            elif sub == "project":
+                tail = args.split("project", 1)[1].strip()
+                try:
+                    title = tail.split('"')[1]
+                    goal = tail.split('"')[3] if len(tail.split('"')) > 3 else None
+                except Exception:
+                    await _post_channel(channel_id, "Usage: /rnd <dept> project \"Title\" \"Goal(optional)\"")
+                    return
+                r = await rnd_project_create(RnDProjectCreate(department=dept, title=title, goal=goal))
+                await _post_channel(channel_id, f"Project created:\n```{json.dumps(r, indent=2)[:2900]}```")
+            elif sub == "experiment":
+                if len(parts) < 3:
+                    await _post_channel(channel_id, "Usage: /rnd <dept> experiment <projectId> \"Hypothesis\"")
+                    return
+                project_id = parts[2]
+                rest = args.split(project_id, 1)[1].strip()
+                try:
+                    hypothesis = rest.split('"')[1]
+                except Exception:
+                    await _post_channel(channel_id, "Provide hypothesis in quotes.")
+                    return
+                r = await rnd_experiment_create(RnDExperimentCreate(project_id=project_id, hypothesis=hypothesis))
+                await _post_channel(channel_id, f"Experiment created:\n```{json.dumps(r, indent=2)[:2900]}```")
+            else:
+                await _post_channel(channel_id, "Subcommand not recognized. Try: bootstrap | project | experiment")
+        except Exception as e:
+            await _post_channel(channel_id, f"R&D command failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type": "ephemeral",
+                         "text": f"R&D command accepted for {dept}. I’ll post results here."},
+                        status_code=200)
+
+@app.post("/slack/commands/ingest")
+async def slack_ingest(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    args = (data.get("text") or "").strip()
+    channel_id = data.get("channel_id")
+
+    if not args:
+        return JSONResponse({"response_type": "ephemeral",
+                             "text": "Usage: /ingest <dept> web <url>"},
+                            status_code=200)
+
+    parts = args.split()
+    if len(parts) < 3 or parts[1].lower() != "web":
+        return JSONResponse({"response_type": "ephemeral",
+                             "text": "Usage: /ingest <dept> web <url>"},
+                            status_code=200)
+    dept, _, url = parts[0], parts[1], parts[2]
+
+    async def run():
+        try:
+            r = await ingest_web(IngestWebPayload(department=dept, url=url))
+            await _post_channel(channel_id, f"Ingested into {dept} R&D knowledge:\n{url}")
+        except Exception as e:
+            await _post_channel(channel_id, f"Ingest failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type": "ephemeral", "text": "On it. Fetching and storing."}, status_code=200)
+
+@app.post("/slack/commands/report")
+async def slack_report(req: Request):
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    args = (data.get("text") or "").strip()
+    channel_id = data.get("channel_id")
+
+    if not args:
+        return JSONResponse({"response_type": "ephemeral",
+                             "text": "Usage: /report <dept> weekly"},
+                            status_code=200)
+
+    parts = args.split()
+    dept = parts[0]
+    interval = parts[1].lower() if len(parts) > 1 else "weekly"
+
+    async def run():
+        try:
+            recents = await supabase_select(
+                "memory",
+                f"select=*&department=eq.{_enc(dept)}&order=timestamp.desc&limit=200"
+            ) or []
+            context = f"Create a {interval} R&D report for the {dept} department. Summarize projects, experiments, findings, and next actions.\n"
+            for r in recents:
+                c = r.get("context", "")
+                d = r.get("decision", "")
+                context += f"- Context: {c}\n  Decision: {d}\n"
+            summary = await call_brain(context)
+            await _post_channel(channel_id, f"[{dept} R&D {interval.title()} Report]\n{summary}")
+            await supabase_insert("memory", {
+                "context": f"[{dept} R&D] {interval} report",
+                "decision": summary,
+                "source": "report",
+                "department": dept,
+                "actor": "R&D Director",
+                "timestamp": now_utc_iso(),
+            })
+        except Exception as e:
+            await _post_channel(channel_id, f"Report failed: {e}")
+
+    asyncio.create_task(run())
+    return JSONResponse({"response_type": "ephemeral",
+                         "text": f"Generating {interval} report for {dept}."},
+                        status_code=200)
+
+# ------------------------------------------------------------
+# Telegram Webhook
+# ------------------------------------------------------------
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: dict):
     msg = update.get("message") or update.get("edited_message") or \
@@ -258,7 +428,9 @@ async def telegram_webhook(update: dict):
 
     return {"ok": True}
 
-# ---------------- Agents (Directors/Employees) ----------------
+# ------------------------------------------------------------
+# Agents (Directors/Employees)
+# ------------------------------------------------------------
 @app.post("/agents/{dept}/{role}/{name}")
 async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayload):
     text = (payload.text or payload.context) or ""
@@ -299,7 +471,9 @@ async def agent_invoke(dept: str, role: str, name: str, payload: AgentInvokePayl
     })
     return {"agent": name, "role": role, "dept": dept, "decision": decision}
 
-# ---------------- Staff APIs ----------------
+# ------------------------------------------------------------
+# Staff APIs
+# ------------------------------------------------------------
 @app.post("/staff/create", name="staff_create")
 async def staff_create(payload: StaffCreatePayload):
     result = await create_staff_core(payload.department, payload.employee_names, payload.slack_channel_id)
@@ -308,7 +482,7 @@ async def staff_create(payload: StaffCreatePayload):
 @app.get("/staff/list")
 async def staff_list(department: Optional[str] = None):
     if department:
-        dep = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(department)}")
+        dep = await sb_get_one("departments", f"select=*&name=eq.{_enc(department)}")
         if not dep:
             return {"ok": True, "staff": []}
         dep_id = dep["id"]
@@ -330,7 +504,9 @@ async def staff_delete(payload: StaffDeletePayload):
             raise HTTPException(status_code=500, detail=f"Supabase update failed: {r.text}")
     return {"ok": True}
 
-# ---------------- Simple Department Router (optional) ----------------
+# ------------------------------------------------------------
+# Simple Department Router (optional)
+# ------------------------------------------------------------
 @app.post("/route/{dept}")
 async def route_to_department(dept: str, request: Request):
     body = await request.json()
@@ -382,7 +558,9 @@ async def route_to_department(dept: str, request: Request):
 
     return {"dept": dept, "target": target or "director", "decision": decision}
 
-# ---------------- Daily CEO Report ----------------
+# ------------------------------------------------------------
+# Daily CEO Report
+# ------------------------------------------------------------
 @app.post("/cron/daily-report")
 async def daily_report():
     records = await supabase_select("memory", "select=*&order=timestamp.desc&limit=200") or []
@@ -404,7 +582,9 @@ async def daily_report():
     })
     return {"ok": True, "summary": decision}
 
-# ---------------- Memory API (vector) ----------------
+# ------------------------------------------------------------
+# Memory API (vector)
+# ------------------------------------------------------------
 @app.post("/memory/remember")
 async def remember(payload: RememberPayload):
     emb = await embed_text(payload.content)
@@ -436,14 +616,16 @@ async def recall(payload: RecallPayload):
     })
     return {"ok": True, "matches": matches}
 
-# ---------------- CORE: create staff (shared) ----------------
+# ------------------------------------------------------------
+# CORE: create staff for a department (shared by API & /hire)
+# ------------------------------------------------------------
 async def create_staff_core(dept_name: str, employee_names: Optional[List[str]], slack_channel_id: Optional[str]):
     dept_name = (dept_name or "").strip()
     if not dept_name:
         return {"ok": False, "error": "department is required"}
 
     # Department get/create
-    dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept_name)}")
+    dep_row = await sb_get_one("departments", f"select=*&name=eq.{_enc(dept_name)}")
     if not dep_row:
         dep_row = await sb_insert_returning("departments", {
             "name": dept_name,
@@ -457,7 +639,7 @@ async def create_staff_core(dept_name: str, employee_names: Optional[List[str]],
     director_name = f"Director {dept_name.title()}"
     dir_row = await sb_get_one(
         "staff",
-        f"select=*&name=eq.{urllib.parse.quote(director_name)}&role=eq.Director&department_id=eq.{department_id}"
+        f"select=*&name=eq.{_enc(director_name)}&role=eq.Director&department_id=eq.{department_id}"
     )
     if not dir_row:
         dir_row = await sb_insert_returning("staff", {
@@ -481,7 +663,7 @@ async def create_staff_core(dept_name: str, employee_names: Optional[List[str]],
     for nm in base_names:
         er = await sb_get_one(
             "staff",
-            f"select=*&name=eq.{urllib.parse.quote(nm)}&role=eq.Employee&department_id=eq.{department_id}"
+            f"select=*&name=eq.{_enc(nm)}&role=eq.Employee&department_id=eq.{department_id}"
         )
         if not er:
             er = await sb_insert_returning("staff", {
@@ -525,42 +707,41 @@ async def create_staff_core(dept_name: str, employee_names: Optional[List[str]],
         ],
     }
 
-from app.schemas import RnDBootstrapPayload, RnDProjectCreate, RnDExperimentCreate, IngestWebPayload
-
-@app.post("/rnd/bootstrap")
-async def rnd_bootstrap(payload: RnDBootstrapPayload):
+# ------------------------------------------------------------
+# R&D: internal helpers used by Slack commands
+# ------------------------------------------------------------
+async def rnd_bootstrap(payload: RnDBootstrapPayload) -> Dict[str, Any]:
     dept = payload.department.strip()
-    n = max(2, min(12, payload.researchers or 5))  # cap reasonable team size
+    n = max(2, min(12, payload.researchers or 5))
 
-    # Create/get Director of R&D
-    director_name = f"Director R&D {dept.title()}"
-    dir_row = await sb_get_one(
-        "staff",
-        f"select=*&name=eq.{urllib.parse.quote(director_name)}&role=eq.Director&department_id=eq.null"  # let’s create under department row
-    )
-
-    # ensure department row
-    dep_row = await sb_get_one("departments", f"select=*&name=eq.{urllib.parse.quote(dept)}")
+    # Ensure department first, then use its id
+    dep_row = await sb_get_one("departments", f"select=*&name=eq.{_enc(dept)}")
     if not dep_row:
         dep_row = await sb_insert_returning("departments", {"name": dept})
     dep_id = dep_row["id"]
 
+    # Director of R&D
+    director_name = f"Director R&D {dept.title()}"
+    dir_row = await sb_get_one(
+        "staff",
+        f"select=*&name=eq.{_enc(director_name)}&role=eq.Director&department_id=eq.{dep_id}"
+    )
     if not dir_row:
         dir_row = await sb_insert_returning("staff", {
             "name": director_name,
             "role": "Director",
             "department_id": dep_id,
             "status": "active",
-            "agent_webhook": agent_endpoint(dept, "Director", director_name)
+            "agent_webhook": agent_endpoint(dept, "Director", director_name),
         })
 
-    # Create N researchers
+    # Researchers
     researchers = []
     for i in range(1, n + 1):
         name = f"{dept.title()} R&D Researcher {i}"
         r = await sb_get_one(
             "staff",
-            f"select=*&name=eq.{urllib.parse.quote(name)}&role=eq.Employee&department_id=eq.{dep_id}"
+            f"select=*&name=eq.{_enc(name)}&role=eq.Employee&department_id=eq.{dep_id}"
         )
         if not r:
             r = await sb_insert_returning("staff", {
@@ -572,7 +753,7 @@ async def rnd_bootstrap(payload: RnDBootstrapPayload):
             })
         researchers.append(r)
 
-    # Reporting lines to Director
+    # Reporting lines
     async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
         for er in researchers:
             exists = await sb_get_one(
@@ -585,20 +766,16 @@ async def rnd_bootstrap(payload: RnDBootstrapPayload):
                     "report_id": er["id"]
                 })
                 if r.status_code >= 400:
-                    return {"ok": False, "error": f"reporting_lines failed: {r.text}"}
+                    raise HTTPException(status_code=500, detail=f"reporting_lines failed: {r.text}")
 
     return {
         "ok": True,
         "department": dept,
         "director": {"id": dir_row["id"], "name": dir_row["name"], "agent_url": dir_row.get("agent_webhook")},
-        "researchers": [
-            {"id": r["id"], "name": r["name"], "agent_url": r.get("agent_webhook")}
-            for r in researchers
-        ]
+        "researchers": [{"id": r["id"], "name": r["name"], "agent_url": r.get("agent_webhook")} for r in researchers]
     }
 
-@app.post("/rnd/project")
-async def rnd_project_create(payload: RnDProjectCreate):
+async def rnd_project_create(payload: RnDProjectCreate) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_projects", json={
             "department": payload.department,
@@ -607,10 +784,10 @@ async def rnd_project_create(payload: RnDProjectCreate):
         })
         if r.status_code >= 400:
             raise HTTPException(status_code=500, detail=r.text)
-        return {"ok": True, "project": r.json()[0]}
+        data = r.json()
+        return {"ok": True, "project": data[0] if isinstance(data, list) else data}
 
-@app.post("/rnd/experiment")
-async def rnd_experiment_create(payload: RnDExperimentCreate):
+async def rnd_experiment_create(payload: RnDExperimentCreate) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
         r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_experiments", json={
             "project_id": payload.project_id,
@@ -620,34 +797,38 @@ async def rnd_experiment_create(payload: RnDExperimentCreate):
         })
         if r.status_code >= 400:
             raise HTTPException(status_code=500, detail=r.text)
-        return {"ok": True, "experiment": r.json()[0]}
+        data = r.json()
+        return {"ok": True, "experiment": data[0] if isinstance(data, list) else data}
 
-@app.post("/rnd/ingest/web")
-async def ingest_web(payload: IngestWebPayload):
-    # very simple reader: fetch text and store; later you can add readability/Boilerpipe
+async def ingest_web(payload: IngestWebPayload) -> Dict[str, Any]:
+    # Robust fetch with redirects + UA
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SuzieQBot/1.0; +https://suzie-q-office.onrender.com)"}
     try:
-        async with httpx.AsyncClient(timeout=25) as c:
+        async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as c:
             r = await c.get(payload.url)
             r.raise_for_status()
             text = r.text
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f"Fetch failed ({e.response.status_code}): {payload.url}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Fetch failed: {e}")
 
     title = payload.url[:120]
-    content = text[:6000]  # keep it manageable
+    content = text[:6000]
 
-    # write to knowledge
+    # Save to knowledge
     async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
-        r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_knowledge", json={
+        kr = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_knowledge", json={
             "department": payload.department,
             "source_url": payload.url,
             "title": title,
             "content": content,
             "tags": ["web_ingest"]
         })
-        r.raise_for_status()
+        if kr.status_code >= 400:
+            raise HTTPException(status_code=500, detail=f"Knowledge insert failed: {kr.text}")
 
-    # add to vector memory so Suzie can recall it later
+    # Vector memory
     emb = await embed_text(f"{title}\n{content[:2000]}")
     await supabase_insert("long_term_memory", {
         "content": f"[{payload.department} R&D] {title}\n{payload.url}",
@@ -660,130 +841,4 @@ async def ingest_web(payload: IngestWebPayload):
         "created_at": now_utc_iso(),
     })
 
-    return {"ok": True}
-
-import asyncio
-
-async def _post_channel(channel_id: str, text: str):
-    if channel_id:
-        await slack_post_message(channel_id, text)
-
-@app.post("/slack/commands/rnd")
-async def slack_rnd(req: Request):
-    body = await req.body()
-    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-    channel_id = data.get("channel_id")
-    args = (data.get("text") or "").strip()
-
-    if not args:
-        return JSONResponse({"response_type":"ephemeral",
-                             "text":"Usage: /rnd <dept> bootstrap [N] | project \"Title\" \"Goal\" | experiment <projectId> \"Hypothesis\""}, status_code=200)
-
-    parts = args.split()
-    dept = parts[0]
-    sub = parts[1].lower() if len(parts) > 1 else ""
-
-    async def run():
-        try:
-            if sub == "bootstrap":
-                n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
-                r = await rnd_bootstrap(RnDBootstrapPayload(department=dept, researchers=n))
-                await _post_channel(channel_id, f"R&D bootstrap for *{dept}*:\n```{json.dumps(r, indent=2)[:2900]}```")
-            elif sub == "project":
-                # Expect quoted title/goal after dept project
-                tail = args.split("project",1)[1].strip()
-                # naive split on quotes:
-                # "Title" "Goal"
-                try:
-                    title = tail.split('"')[1]
-                    goal = tail.split('"')[3] if len(tail.split('"'))>3 else None
-                except Exception:
-                    await _post_channel(channel_id, "Usage: /rnd <dept> project \"Title\" \"Goal(optional)\"")
-                    return
-                r = await rnd_project_create(RnDProjectCreate(department=dept, title=title, goal=goal))
-                await _post_channel(channel_id, f"Project created:\n```{json.dumps(r, indent=2)[:2900]}```")
-            elif sub == "experiment":
-                # /rnd <dept> experiment <projectId> "Hypothesis"
-                if len(parts) < 3:
-                    await _post_channel(channel_id, "Usage: /rnd <dept> experiment <projectId> \"Hypothesis\"")
-                    return
-                project_id = parts[2]
-                hypothesis = args.split(project_id,1)[1].strip()
-                try:
-                    hypothesis = hypothesis.split('"')[1]
-                except Exception:
-                    await _post_channel(channel_id, "Provide hypothesis in quotes.")
-                    return
-                r = await rnd_experiment_create(RnDExperimentCreate(project_id=project_id, hypothesis=hypothesis))
-                await _post_channel(channel_id, f"Experiment created:\n```{json.dumps(r, indent=2)[:2900]}```")
-            else:
-                await _post_channel(channel_id, "Subcommand not recognized. Try: bootstrap | project | experiment")
-        except Exception as e:
-            await _post_channel(channel_id, f"R&D command failed: {e}")
-
-    asyncio.create_task(run())
-    return JSONResponse({"response_type":"ephemeral",
-                         "text": f"R&D command accepted for {dept}. I’ll post results here."}, status_code=200)
-
-@app.post("/slack/commands/ingest")
-async def slack_ingest(req: Request):
-    body = await req.body()
-    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-    args = (data.get("text") or "").strip()
-    channel_id = data.get("channel_id")
-    if not args:
-        return JSONResponse({"response_type":"ephemeral","text":"Usage: /ingest <dept> web <url>"}, status_code=200)
-
-    parts = args.split()
-    if len(parts) < 3 or parts[1].lower() != "web":
-        return JSONResponse({"response_type":"ephemeral","text":"Usage: /ingest <dept> web <url>"}, status_code=200)
-    dept, _, url = parts[0], parts[1], parts[2]
-
-    async def run():
-        try:
-            r = await ingest_web(IngestWebPayload(department=dept, url=url))
-            await _post_channel(channel_id, f"Ingested into {dept} R&D knowledge:\n{url}")
-        except Exception as e:
-            await _post_channel(channel_id, f"Ingest failed: {e}")
-
-    asyncio.create_task(run())
-    return JSONResponse({"response_type":"ephemeral","text":"On it. Fetching and storing."}, status_code=200)
-
-@app.post("/slack/commands/report")
-async def slack_report(req: Request):
-    body = await req.body()
-    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-    args = (data.get("text") or "").strip()
-    channel_id = data.get("channel_id")
-
-    if not args:
-        return JSONResponse({"response_type":"ephemeral","text":"Usage: /report <dept> weekly"}, status_code=200)
-
-    parts = args.split()
-    dept = parts[0]
-    interval = parts[1].lower() if len(parts) > 1 else "weekly"
-
-    async def run():
-        try:
-            # pull recent activity
-            recents = await supabase_select("memory", f"select=*&department=eq.{urllib.parse.quote(dept)}&order=timestamp.desc&limit=200")
-            context = f"Create a {interval} R&D report for the {dept} department. Summarize projects, experiments, findings, and next actions.\n"
-            for r in recents or []:
-                c = r.get("context","")
-                d = r.get("decision","")
-                context += f"- Context: {c}\n  Decision: {d}\n"
-            summary = await call_brain(context)
-            await _post_channel(channel_id, f"[{dept} R&D {interval.title()} Report]\n{summary}")
-            await supabase_insert("memory", {
-                "context": f"[{dept} R&D] {interval} report",
-                "decision": summary,
-                "source": "report",
-                "department": dept,
-                "actor": "R&D Director",
-                "timestamp": now_utc_iso(),
-            })
-        except Exception as e:
-            await _post_channel(channel_id, f"Report failed: {e}")
-
-    asyncio.create_task(run())
-    return JSONResponse({"response_type":"ephemeral","text":f"Generating {interval} report for {dept}."}, status_code=200)
+    return {"ok": True, "title": title}
