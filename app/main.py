@@ -284,61 +284,76 @@ async def slack_rnd(req: Request):
     body = await req.body()
     data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
     channel_id = data.get("channel_id")
-    args = (data.get("text") or "").strip()
+    args_raw = (data.get("text") or "").strip()
 
-    if not args:
+    if not args_raw:
         return JSONResponse({"response_type": "ephemeral",
-                             "text": "Usage: /rnd <dept> bootstrap [N] | project \"Title\" \"Goal\" | experiment <projectId> \"Hypothesis\""},
+                             "text": "Usage: /rnd list [<dept>] [projects|experiments] | /rnd <dept> bootstrap [N] | /rnd <dept> project \"Title\" \"Goal\" | /rnd <dept> experiment <projectId> \"Hypothesis\""},
                             status_code=200)
 
-    parts = args.split()
-    dept = parts[0]
-    sub = parts[1].lower() if len(parts) > 1 else ""
+    parts = args_raw.split()
 
+    # --------- Parse mode (supports list-first or dept-first) ---------
+    mode = None          # "list" | "dept"
+    dept = None
+    sub = None
+    tail_after = ""      # the remainder after we consume initial tokens
+
+    if parts[0].lower() == "list":
+        mode = "list"
+        tail_after = args_raw[len("list"):].strip()
+    else:
+        mode = "dept"
+        dept = parts[0]
+        tail_after = args_raw[len(dept):].strip()
+        # subcommand after dept, if any
+        if tail_after:
+            sub = tail_after.split()[0].lower()
+
+    # ---------- Runner ----------
     async def run():
         try:
-            if sub == "list":
+            # ===== LIST MODE =====
+            if mode == "list":
+                # Accept patterns:
                 # /rnd list
-                # /rnd list <dept>
-                # /rnd list <dept> projects
-                # /rnd list <dept> experiments
                 # /rnd list projects
                 # /rnd list experiments
-                tail = args.split("list", 1)[1].strip() if "list" in args else ""
-                parts_tail = tail.split()
-                kind = None
+                # /rnd list <dept>
+                # /rnd list <dept> projects|experiments
+                # /rnd list project <PROJECT_ID>
+                tail = tail_after
+                tail_parts = tail.split()
+
+                kind = "projects"      # default view
                 dept_filter = None
                 project_id = None
 
-                # quick parse
-                if len(parts_tail) == 0:
-                    # default: list latest projects
-                    kind = "projects"
-                elif len(parts_tail) == 1:
-                    if parts_tail[0].lower() in ["projects", "experiments"]:
-                        kind = parts_tail[0].lower()
+                if len(tail_parts) == 0:
+                    pass  # default
+                elif len(tail_parts) == 1:
+                    if tail_parts[0].lower() in ["projects", "experiments"]:
+                        kind = tail_parts[0].lower()
                     else:
-                        dept_filter = parts_tail[0]
-                        kind = "projects"
+                        dept_filter = tail_parts[0]
                 else:
-                    # e.g., "<dept> projects" or "<dept> experiments" or "project <ID>"
-                    if parts_tail[0].lower() in ["project", "proj"]:
-                        # /rnd list project <PROJECT_ID>
-                        if len(parts_tail) >= 2:
-                            project_id = parts_tail[1]
+                    if tail_parts[0].lower() in ["project", "proj"]:
+                        if len(tail_parts) >= 2:
+                            project_id = tail_parts[1]
                             kind = "experiments"
                         else:
                             await _post_channel(channel_id, "Usage: /rnd list project <PROJECT_ID>")
                             return
                     else:
-                        dept_filter = parts_tail[0]
-                        kind = parts_tail[1].lower() if len(parts_tail) > 1 else "projects"
+                        dept_filter = tail_parts[0]
+                        if len(tail_parts) >= 2 and tail_parts[1].lower() in ["projects","experiments"]:
+                            kind = tail_parts[1].lower()
 
                 if kind == "projects":
                     rows = await list_projects(dept=dept_filter)
                     msg = fmt_projects(rows)
                     await _post_channel(channel_id, f"*R&D Projects*{f' (dept: {dept_filter})' if dept_filter else ''}:\n{msg}")
-                elif kind == "experiments":
+                else:  # experiments
                     rows = await list_experiments(project_id=project_id, dept=dept_filter)
                     msg = fmt_experiments(rows)
                     context = ""
@@ -347,17 +362,40 @@ async def slack_rnd(req: Request):
                     elif dept_filter:
                         context = f" (dept: {dept_filter})"
                     await _post_channel(channel_id, f"*R&D Experiments*{context}:\n{msg}")
-                else:
-                    await _post_channel(channel_id, "Try: `/rnd list`, `/rnd list <dept>`, `/rnd list projects`, `/rnd list <dept> experiments`, or `/rnd list project <PROJECT_ID>`")
                 return
 
-            # ------- existing subcommands you already have -------
+            # ===== DEPT MODE =====
+            # subcommands after a department: list | bootstrap | project | experiment
+            if sub == "list":
+                # Allow: /rnd <dept> list [projects|experiments]
+                tail = tail_after[len("list"):].strip() if tail_after.lower().startswith("list") else ""
+                kind = "projects"
+                if tail and tail.split()[0].lower() in ["projects","experiments"]:
+                    kind = tail.split()[0].lower()
+
+                if kind == "projects":
+                    rows = await list_projects(dept=dept)
+                    msg = fmt_projects(rows)
+                    await _post_channel(channel_id, f"*R&D Projects* (dept: {dept}):\n{msg}")
+                else:
+                    rows = await list_experiments(project_id=None, dept=dept)
+                    msg = fmt_experiments(rows)
+                    await _post_channel(channel_id, f"*R&D Experiments* (dept: {dept}):\n{msg}")
+                return
+
             if sub == "bootstrap":
-                n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
+                n = 5
+                tail_tokens = tail_after.split()
+                # tail_after looks like: "bootstrap [N]" — consume
+                if len(tail_tokens) >= 2 and tail_tokens[1].isdigit():
+                    n = int(tail_tokens[1])
                 res = await rnd_bootstrap(RnDBootstrapPayload(department=dept, researchers=n))
                 await _post_channel(channel_id, f"R&D bootstrap for *{dept}*:\n```{json.dumps(res, indent=2)[:2900]}```")
-            elif sub == "project":
-                tail = args.split("project", 1)[1].strip()
+                return
+
+            if sub == "project":
+                # /rnd <dept> project "Title" "Goal?"
+                tail = tail_after.split("project", 1)[1].strip() if "project" in tail_after.lower() else ""
                 try:
                     title = tail.split('"')[1]
                     goal = tail.split('"')[3] if len(tail.split('"')) > 3 else None
@@ -366,12 +404,21 @@ async def slack_rnd(req: Request):
                     return
                 r = await rnd_project_create(RnDProjectCreate(department=dept, title=title, goal=goal))
                 await _post_channel(channel_id, f"Project created:\n```{json.dumps(r, indent=2)[:2900]}```")
-            elif sub == "experiment":
-                if len(parts) < 3:
-                    await _post_channel(channel_id, "Usage: /rnd <dept> experiment <projectId> \"Hypothesis\"")
+                return
+
+            if sub == "experiment":
+                # /rnd <dept> experiment <PROJECT_ID> "Hypothesis"
+                toks = tail_after.split()
+                if len(toks) < 2:
+                    await _post_channel(channel_id, "Usage: /rnd <dept> experiment <PROJECT_ID> \"Hypothesis\"")
                     return
-                project_id = parts[2]
-                rest = args.split(project_id, 1)[1].strip()
+                # consume 'experiment' then next token is project id
+                try:
+                    proj_idx = toks.index("experiment") + 1 if "experiment" in toks else 1
+                except Exception:
+                    proj_idx = 1
+                project_id = toks[proj_idx]
+                rest = tail_after.split(project_id, 1)[1].strip()
                 try:
                     hypothesis = rest.split('"')[1]
                 except Exception:
@@ -379,16 +426,18 @@ async def slack_rnd(req: Request):
                     return
                 r = await rnd_experiment_create(RnDExperimentCreate(project_id=project_id, hypothesis=hypothesis))
                 await _post_channel(channel_id, f"Experiment created:\n```{json.dumps(r, indent=2)[:2900]}```")
-            else:
-                await _post_channel(channel_id, "Subcommand not recognized. Try: list | bootstrap | project | experiment")
+                return
+
+            # If we got here, subcommand not recognized
+            await _post_channel(channel_id, "Subcommand not recognized. Try: list | bootstrap | project | experiment")
         except Exception as e:
             await _post_channel(channel_id, f"R&D command failed: {e}")
 
-
     asyncio.create_task(run())
     return JSONResponse({"response_type": "ephemeral",
-                         "text": f"R&D command accepted for {dept}. I’ll post results here."},
+                         "text": f"R&D command accepted for {parts[0] if parts else 'list'}. I’ll post results here."},
                         status_code=200)
+
 
 @app.post("/slack/commands/ingest")
 async def slack_ingest(req: Request):
