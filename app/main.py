@@ -842,7 +842,7 @@ async def rnd_bootstrap(payload: RnDBootstrapPayload) -> Dict[str, Any]:
 async def rnd_project_create(payload: RnDProjectCreate) -> Dict[str, Any]:
     """
     Create an R&D project and return the created row.
-    Uses sb_insert_returning so Supabase replies with JSON.
+    If insert returns no body, fetch by (department, title).
     """
     row = await sb_insert_returning("rnd_projects", {
         "department": payload.department,
@@ -850,14 +850,19 @@ async def rnd_project_create(payload: RnDProjectCreate) -> Dict[str, Any]:
         "goal": payload.goal
     })
     if not row:
-        # Fallback: return a simple ack instead of trying to parse empty body
-        return {"ok": False, "error": "Supabase did not return a row. Check RLS and table name."}
+        # Fallback: fetch the most recent match by dept+title
+        q = f"select=*&department=eq.{_enc(payload.department)}&title=eq.{_enc(payload.title)}&order=created_at.desc&limit=1"
+        rows = await supabase_select("rnd_projects", q)
+        if rows:
+            row = rows[0]
+        else:
+            return {"ok": False, "error": "Insert succeeded but no row returned; and lookup found nothing. Check RLS/policies."}
     return {"ok": True, "project": row}
 
 async def rnd_experiment_create(payload: RnDExperimentCreate) -> Dict[str, Any]:
     """
     Create an R&D experiment and return the created row.
-    Uses sb_insert_returning so Supabase replies with JSON.
+    If insert returns no body, fetch by (project_id, hypothesis).
     """
     row = await sb_insert_returning("rnd_experiments", {
         "project_id": payload.project_id,
@@ -866,23 +871,18 @@ async def rnd_experiment_create(payload: RnDExperimentCreate) -> Dict[str, Any]:
         "metrics": payload.metrics or []
     })
     if not row:
-        return {"ok": False, "error": "Supabase did not return a row. Check RLS and table name."}
+        q = (
+            "select=*&"
+            f"project_id=eq.{_enc(payload.project_id)}&"
+            f"hypothesis=eq.{_enc(payload.hypothesis)}&"
+            "order=created_at.desc&limit=1"
+        )
+        rows = await supabase_select("rnd_experiments", q)
+        if rows:
+            row = rows[0]
+        else:
+            return {"ok": False, "error": "Insert succeeded but no row returned; and lookup found nothing. Check RLS/policies."}
     return {"ok": True, "experiment": row}
-
-async def ingest_web(payload: IngestWebPayload) -> Dict[str, Any]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SuzieQBot/1.0; +https://suzie-q-office.onrender.com)"}
-    try:
-        async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as c:
-            r = await c.get(payload.url)
-            r.raise_for_status()
-            text = r.text
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=400, detail=f"Fetch failed ({e.response.status_code}): {payload.url}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Fetch failed: {e}")
-
-    title = payload.url[:120]
-    content = text[:6000]
 
     async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
         kr = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_knowledge", json={
