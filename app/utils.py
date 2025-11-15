@@ -128,7 +128,9 @@ async def sb_get_one(table: str, filter_qs: str) -> Optional[Dict[str, Any]]:
 
 async def sb_insert_returning(table: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Insert a row and return the created row (requires Prefer: return=representation).
+    Insert a row and try to return the created row.
+    If Supabase returns an empty body (despite Prefer: return=representation),
+    we won't crash—returns None instead.
     """
     if not SUPABASE_URL:
         return None
@@ -136,9 +138,30 @@ async def sb_insert_returning(table: str, payload: Dict[str, Any]) -> Optional[D
     headers["Prefer"] = "return=representation"
     async with httpx.AsyncClient(timeout=60, headers=headers) as client:
         r = await client.post(f"{SUPABASE_URL}/rest/v1/{table}", json=payload)
-        r.raise_for_status()
-        arr = r.json()
-        return arr[0] if arr else None
+        # If Supabase rejects, raise with full context
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Bubble up full response for easier debugging in Slack
+            raise RuntimeError(f"Supabase {table} insert failed: {e.response.status_code} {e.response.text}")
+
+        # Some deployments still return empty body on 201
+        raw = r.text or ""
+        if not raw.strip():
+            return None
+
+        # Try to parse; if it's an array, return first row
+        try:
+            data = r.json()
+            if isinstance(data, list):
+                return data[0] if data else None
+            if isinstance(data, dict):
+                return data
+            return None
+        except Exception:
+            # Empty or non-JSON body
+            return None
+
 
 def agent_endpoint(dept: str, role: str, name: str) -> str:
     """
