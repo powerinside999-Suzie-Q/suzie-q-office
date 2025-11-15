@@ -234,6 +234,51 @@ async def slack_ask(req: Request):
     return JSONResponse({"response_type": "ephemeral", "text": "Sent to Suzie Q…"}, status_code=200)
 
 # ------------------------------ Slack Slash: R&D / Ingest / Report ------------------------------
+# ---------- R&D LIST HELPERS ----------
+async def list_projects(dept: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    if dept:
+        qs = f"select=*&department=eq.{_enc(dept)}&order=created_at.desc&limit={limit}"
+    else:
+        qs = f"select=*&order=created_at.desc&limit={limit}"
+    return await supabase_select("rnd_projects", qs) or []
+
+async def list_experiments(project_id: Optional[str] = None, dept: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    # Fast paths
+    if project_id:
+        qs = f"select=*&project_id=eq.{_enc(project_id)}&order=created_at.desc&limit={limit}"
+        return await supabase_select("rnd_experiments", qs) or []
+
+    if not dept:
+        # No dept filter → just latest experiments
+        qs = f"select=*&order=created_at.desc&limit={limit}"
+        return await supabase_select("rnd_experiments", qs) or []
+
+    # Dept filter → fetch project ids for that department, then filter experiments by IN (...)
+    projects = await list_projects(dept=dept, limit=200)
+    if not projects:
+        return []
+    ids = [p["id"] for p in projects if p.get("id")]
+    # Build in.(...) clause; URL-safe
+    idlist = ",".join(ids)
+    qs = f"select=*&project_id=in.({idlist})&order=created_at.desc&limit={limit}"
+    return await supabase_select("rnd_experiments", qs) or []
+
+def fmt_projects(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "No projects found."
+    lines = []
+    for r in rows[:20]:
+        lines.append(f"- *{r.get('title','Untitled')}*  _(dept: {r.get('department','?')})_\n  id: `{r.get('id','')}`  status: {r.get('status','')}")
+    return "\n".join(lines)
+
+def fmt_experiments(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "No experiments found."
+    lines = []
+    for r in rows[:20]:
+        lines.append(f"- *{r.get('hypothesis','(no hypothesis)')}*\n  id: `{r.get('id','')}`  project_id: `{r.get('project_id','')}`  status: {r.get('status','')}")
+    return "\n".join(lines)
+
 @app.post("/slack/commands/rnd")
 async def slack_rnd(req: Request):
     body = await req.body()
