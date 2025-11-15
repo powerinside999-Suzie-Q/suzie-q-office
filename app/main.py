@@ -840,29 +840,34 @@ async def rnd_bootstrap(payload: RnDBootstrapPayload) -> Dict[str, Any]:
     }
 
 async def rnd_project_create(payload: RnDProjectCreate) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
-        r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_projects", json={
-            "department": payload.department,
-            "title": payload.title,
-            "goal": payload.goal
-        })
-        if r.status_code >= 400:
-            raise HTTPException(status_code=500, detail=r.text)
-        data = r.json()
-        return {"ok": True, "project": data[0] if isinstance(data, list) else data}
+    """
+    Create an R&D project and return the created row.
+    Uses sb_insert_returning so Supabase replies with JSON.
+    """
+    row = await sb_insert_returning("rnd_projects", {
+        "department": payload.department,
+        "title": payload.title,
+        "goal": payload.goal
+    })
+    if not row:
+        # Fallback: return a simple ack instead of trying to parse empty body
+        return {"ok": False, "error": "Supabase did not return a row. Check RLS and table name."}
+    return {"ok": True, "project": row}
 
 async def rnd_experiment_create(payload: RnDExperimentCreate) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
-        r = await c.post(f"{SUPABASE_URL}/rest/v1/rnd_experiments", json={
-            "project_id": payload.project_id,
-            "hypothesis": payload.hypothesis,
-            "method": payload.method,
-            "metrics": payload.metrics or []
-        })
-        if r.status_code >= 400:
-            raise HTTPException(status_code=500, detail=r.text)
-        data = r.json()
-        return {"ok": True, "experiment": data[0] if isinstance(data, list) else data}
+    """
+    Create an R&D experiment and return the created row.
+    Uses sb_insert_returning so Supabase replies with JSON.
+    """
+    row = await sb_insert_returning("rnd_experiments", {
+        "project_id": payload.project_id,
+        "hypothesis": payload.hypothesis,
+        "method": payload.method,
+        "metrics": payload.metrics or []
+    })
+    if not row:
+        return {"ok": False, "error": "Supabase did not return a row. Check RLS and table name."}
+    return {"ok": True, "experiment": row}
 
 async def ingest_web(payload: IngestWebPayload) -> Dict[str, Any]:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; SuzieQBot/1.0; +https://suzie-q-office.onrender.com)"}
