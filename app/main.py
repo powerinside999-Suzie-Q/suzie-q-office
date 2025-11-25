@@ -172,11 +172,100 @@ def health():
 # SLACK EVENTS
 # --------------------------------
 
+
 @app.get("/slack/events")
 def slack_events_get():
     """So hitting this URL in a browser doesn't 405."""
     return PlainTextResponse("Slack Events endpoint. Use POST.", status_code=200)
 
+@app.get("/gmail/connect")
+def gmail_connect():
+    """
+    Returns an auth_url you can open in the browser to connect a Gmail account.
+    """
+    flow = Flow.from_client_config(_google_client_config(), scopes=GMAIL_SCOPES)
+    flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    return {"auth_url": auth_url}
+
+@app.get("/gmail/oauth/callback")
+async def gmail_callback(request: Request):
+    """
+    Google redirects here after login. We store tokens in Supabase.
+    """
+    full_url = str(request.url)
+
+    flow = Flow.from_client_config(_google_client_config(), scopes=GMAIL_SCOPES)
+    flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    flow.fetch_token(authorization_response=full_url)
+
+    creds = flow.credentials
+    service = build("gmail", "v1", credentials=creds)
+    profile = service.users().getProfile(userId="me").execute()
+    google_user = profile.get("emailAddress", "me")
+
+    await _gmail_store_tokens(google_user, creds)
+
+    return PlainTextResponse(f"Gmail connected for {google_user}. You can close this tab.")
+
+@app.post("/gmail/send")
+async def gmail_send(payload: GmailSendPayload):
+    """
+    Send an email via connected Gmail account.
+    """
+    creds = await _gmail_load_creds(payload.user)
+    if not creds:
+        raise HTTPException(
+            status_code=400,
+            detail="No Gmail tokens found. First visit /gmail/connect and complete auth.",
+        )
+
+    service = build("gmail", "v1", credentials=creds)
+    raw = _mime_message_raw(payload.to, payload.subject, payload.body, sender=payload.sender)
+
+    sent = service.users().messages().send(
+        userId="me", body={"raw": raw}
+    ).execute()
+
+    return {
+        "ok": True,
+        "id": sent.get("id"),
+        "threadId": sent.get("threadId"),
+    }
+
+@app.post("/gmail/followup")
+async def gmail_followup(payload: GmailFollowupPayload):
+    """
+    Suzie writes and sends a follow-up email, based on prior context.
+    """
+    # 1) Ask the brain to write the follow-up
+    prompt = (
+        f"You are Suzie Q, an AI CEO writing a {payload.tone} follow-up email.\n"
+        f"Context of previous interaction:\n{payload.previous_context}\n\n"
+        "Write a concise follow-up email that bumps the thread, adds value, and has a clear CTA.\n"
+        "Return only the email body text, no subject line."
+    )
+
+    body_text = await call_brain(prompt)
+
+    # 2) Send via Gmail
+    creds = await _gmail_load_creds(payload.user)
+    if not creds:
+        raise HTTPException(
+            status_code=400,
+            detail="No Gmail tokens found. Connect Gmail via /gmail/connect first.",
+        )
+
+    service = build("gmail", "v1", credentials=creds)
+    raw = _mime_message_raw(payload.to, payload.subject, body_text)
+    sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+    return {"ok": True, "sent_body": body_text, "id": sent.get("id")}
 
 @app.post("/slack/events")
 async def slack_events(req: Request):
@@ -485,6 +574,77 @@ async def slack_leads(req: Request):
         status_code=200,
     )
 
+@app.post("/slack/commands/email")
+async def slack_email(req: Request):
+    """
+    /email send to@example.com "Subject line" "Body text"
+
+    This assumes you already connected your Gmail and know which google_user to use.
+    You can hardcode your Gmail user, e.g. put it in GMAIL_PRIMARY_USER env.
+    """
+    body = await req.body()
+    data = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    text = (data.get("text") or "").strip()
+    channel_id = data.get("channel_id")
+
+    if not text.lower().startswith("send "):
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": 'Usage: /email send to@example.com "Subject" "Body"',
+            },
+            status_code=200,
+        )
+
+    # very simple parser: send <to> "Subject" "Body"
+    try:
+        rest = text[len("send "):].strip()
+        # rest format: someone@example.com "Subject" "Body"
+        to_part, _space, after_to = rest.partition(" ")
+        if not _space:
+            raise ValueError("Missing subject/body.")
+        segments = after_to.split('"')
+        # segments roughly: ['', Subject, ' ', Body, '']
+        subject = segments[1].strip()
+        body_text = segments[3].strip()
+    except Exception:
+        return JSONResponse(
+            {
+                "response_type": "ephemeral",
+                "text": 'Could not parse. Try: /email send to@example.com "Subject" "Body"',
+            },
+            status_code=200,
+        )
+
+    gmail_user = os.getenv("GMAIL_PRIMARY_USER", "")  # set this env var
+
+    async def run():
+        try:
+            creds = await _gmail_load_creds(gmail_user)
+            if not creds:
+                await _post_channel(
+                    channel_id,
+                    "No Gmail tokens found. Open /gmail/connect in a browser and finish the Google login.",
+                )
+                return
+
+            service = build("gmail", "v1", credentials=creds)
+            raw = _mime_message_raw(to_part, subject, body_text)
+            sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+            await _post_channel(
+                channel_id,
+                f"Email sent to {to_part} with subject '{subject}'. (id={sent.get('id')})",
+            )
+        except Exception as e:
+            await _post_channel(channel_id, f"Email send failed: {e}")
+
+    asyncio.create_task(run())
+
+    return JSONResponse(
+        {"response_type": "ephemeral", "text": "Sending email… I’ll confirm here."},
+        status_code=200,
+    )
 
 # --------------------------------
 # TELEGRAM WEBHOOK (optional)
