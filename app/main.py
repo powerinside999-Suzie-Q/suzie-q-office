@@ -1,17 +1,14 @@
-# app/main.py
-
 import os
 import json
 import asyncio
 import urllib.parse
+import base64
 from typing import Optional, List, Dict, Any
 from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
-
-import base64
 
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -25,6 +22,8 @@ from app.schemas import (
     RecallPayload,
     StaffCreatePayload,
     StaffDeletePayload,
+    GmailSendPayload,
+    GmailFollowupPayload,
 )
 from app.utils import (
     call_brain,
@@ -42,6 +41,7 @@ from app.utils import (
     HEADERS_SB,
     SUPABASE_URL,
 )
+
 
 # --------------------------------
 # ENV & HELPERS
