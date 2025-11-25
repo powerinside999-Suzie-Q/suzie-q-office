@@ -65,6 +65,86 @@ async def _post_channel(channel_id: Optional[str], text: str, thread_ts: Optiona
     if channel_id:
         await slack_post_message(channel_id, text, thread_ts=thread_ts)
 
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+
+def _google_client_config():
+    return {
+        "web": {
+            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+            "project_id": "suzie-q",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+            "redirect_uris": [os.getenv("GOOGLE_REDIRECT_URI")],
+        }
+    }
+
+
+async def _gmail_store_tokens(google_user: str, creds: Credentials):
+    payload = {
+        "google_user": google_user,
+        "access_token": creds.token,
+        "refresh_token": getattr(creds, "refresh_token", None),
+        "scope": " ".join(GMAIL_SCOPES),
+        "token_type": "Bearer",
+        "expiry": creds.expiry.isoformat() if getattr(creds, "expiry", None) else None,
+        "updated_at": now_utc_iso(),
+    }
+    headers = dict(HEADERS_SB)
+    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+
+    async with httpx.AsyncClient(timeout=30, headers=headers) as c:
+        r = await c.post(
+            f"{SUPABASE_URL}/rest/v1/oauth_google_tokens",
+            params={"on_conflict": "google_user"},
+            json=payload,
+        )
+        r.raise_for_status()
+
+
+async def _gmail_load_creds(google_user: str) -> Optional[Credentials]:
+    async with httpx.AsyncClient(timeout=30, headers=HEADERS_SB) as c:
+        r = await c.get(
+            f"{SUPABASE_URL}/rest/v1/oauth_google_tokens?select=*&google_user=eq.{_enc(google_user)}"
+        )
+        r.raise_for_status()
+        arr = r.json()
+        if not arr:
+            return None
+        row = arr[0]
+
+    creds = Credentials(
+        token=row["access_token"],
+        refresh_token=row.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.getenv("GOOGLE_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+        scopes=GMAIL_SCOPES,
+    )
+
+    # Refresh if needed
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(GoogleRequest())
+        await _gmail_store_tokens(google_user, creds)
+
+    return creds
+
+
+def _mime_message_raw(to: str, subject: str, body: str, sender: Optional[str] = None) -> str:
+    from email.mime.text import MIMEText
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["to"] = to
+    if sender:
+        msg["from"] = sender
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    return raw
 
 # --------------------------------
 # FASTAPI APP
